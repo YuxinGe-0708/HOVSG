@@ -130,7 +130,17 @@ class RGBDDataset(Dataset, ABC):
         pcd.transform(camera_pose)
         return pcd
     
-    def create_3d_masks(self, masks, depth, full_pcd, full_pcd_tree, camera_pose, down_size=0.02, filter_distance=None):
+    def create_3d_masks(
+        self,
+        masks,
+        depth,
+        full_pcd,
+        full_pcd_tree,
+        camera_pose,
+        down_size=0.02,
+        filter_distance=None,
+        association_distance=None,
+    ):
         """
         create 3d masks from 2D masks
         Args:
@@ -140,11 +150,12 @@ class RGBDDataset(Dataset, ABC):
             full_pcd_tree: KD-Tree of full point cloud
             camera_pose: camera pose
             down_size: voxel size for downsampling
+            filter_distance: maximum metric depth used to create each mask
+            association_distance: maximum distance from a mask point to its
+                nearest point in the global map; None disables this gate
         Returns:
             list of 3D masks as Open3D point clouds
         """
-        camera_matrix = self.depth_intrinsics
-        depth_scale = self.scale
         pcd_list = []
         pcd = np.asarray(full_pcd.points)
         depth = np.array(depth)
@@ -153,16 +164,40 @@ class RGBDDataset(Dataset, ABC):
             mask = masks[i]["segmentation"]
             mask = np.array(mask)
             # create pcd from mask
-            pcd_masked = self.create_pcd(mask, depth, camera_pose, mask_img=True, filter_distance=filter_distance)
+            pcd_masked = self.create_pcd(
+                mask,
+                depth,
+                camera_pose,
+                mask_img=True,
+                filter_distance=filter_distance,
+            )
             # using KD-Tree to find the nearest points in the point cloud
             pcd_masked = np.asarray(pcd_masked.points)
+            if pcd_masked.shape[0] == 0:
+                pcd_list.append(o3d.geometry.PointCloud())
+                continue
+
             dist, indices = full_pcd_tree.query(pcd_masked, k=1, workers=-1)
+            valid = np.isfinite(dist)
+            if association_distance is not None and np.isfinite(
+                association_distance
+            ):
+                if association_distance <= 0:
+                    raise ValueError("association_distance must be positive")
+                valid &= dist <= association_distance
+
+            indices = np.unique(indices[valid])
+            if indices.shape[0] == 0:
+                pcd_list.append(o3d.geometry.PointCloud())
+                continue
+
             pcd_masked = pcd[indices]
             pcd_mask = o3d.geometry.PointCloud()
             pcd_mask.points = o3d.utility.Vector3dVector(pcd_masked)
             colors = np.asarray(full_pcd.colors)
-            colors = colors[indices]
-            pcd_mask.colors = o3d.utility.Vector3dVector(colors)
+            if colors.shape[0] == pcd.shape[0]:
+                colors = colors[indices]
+                pcd_mask.colors = o3d.utility.Vector3dVector(colors)
             pcd_mask = pcd_mask.voxel_down_sample(voxel_size=down_size)
             pcd_list.append(pcd_mask)
         return pcd_list

@@ -1,0 +1,84 @@
+main:
+  device: cuda
+  dataset: real_robot
+  scene_id: scene_001
+  split: test
+
+  package_path: /mnt/data/real_camera/isaac/HOV-SG-graph-dev/hovsg
+
+  # Base directory for robot recordings.
+  # The program appends: split/scene_id
+  # Actual input directory:
+  # /mnt/data/real_camera/robot_recordings/test/scene_001
+  # Each scene's camera.json must define exactly one depth conversion:
+  # depth_meters_per_unit: 0.001  # raw millimeters multiplied by 0.001 -> meters
+  # or
+  # depth_units_per_meter: 1000.0 # raw millimeters divided by 1000 -> meters
+  # The ambiguous legacy field depth_scale is rejected.
+
+  dataset_path: /mnt/data/real_camera/robot_recordings
+
+  save_path: /mnt/data/real_camera/outputs/HOV-SG-graph-dev
+
+models:
+  clip:
+    type: ViT-H-14
+    checkpoint: /mnt/data/real_camera/isaac/HOV-SG-graph-dev/checkpoints/laion2b_s32b_b79k.bin
+
+  sam:
+    type: vit_h
+    checkpoint: /mnt/data/real_camera/isaac/HOV-SG-graph-dev/checkpoints/sam_vit_h_4b8939.pth
+    points_per_side: 12
+    pred_iou_thresh: 0.88
+    points_per_batch: 144
+    crop_n_layers: 0
+    stability_score_thresh: 0.95
+    min_mask_region_area: 100
+
+pipeline:
+  extract_semantics: false
+  create_graph: false
+  create_navigation: false
+
+  voxel_size: 0.03
+  skip_frames: 1
+  # Keep a frame when either motion threshold is reached.
+  keyframe_translation_m: 0.10
+  keyframe_rotation_deg: 10.0
+  # Reject discontinuous localization poses instead of corrupting the map.
+  max_pose_translation_jump_m: 0.75
+  max_pose_rotation_jump_deg: 45.0
+  # Downsample the accumulated point cloud every N accepted keyframes.
+  pointcloud_fusion_batch_size: 10
+  log_every_n_frames: 1 # print progress every n frames
+  min_pcd_points: 30
+
+  # Aurora 930 driver is configured to keep 150-4000 mm.
+  min_depth_m: 0.15
+  max_depth_m: 4.0
+  association_distance_m: 0.05
+
+  outlier_nb_neighbors: 20
+  outlier_std_ratio: 2.0
+
+  init_overlap_thresh: 0.75
+  overlap_thresh_factor: 0.025
+  iou_thresh: 0.05
+  clip_masked_weight: 0.4418
+  clip_bbox_margin: 50
+  feature_dbscan_eps: 0.01
+  max_mask_distance: 5.0
+  depth_weighting: false
+  grid_resolution: 0.05
+  merge_type: sequential
+  save_intermediate_results: true
+  obj_labels: HM3DSEM_LABELS
+  merge_objects_graph: false
+
+robot:
+  camera_height_m: 1.05
+  radius_m: 0.28
+  safety_margin_m: 0.10
+
+navigation:
+  cell_size_m: 0.05

@@ -37,6 +37,7 @@ from hovsg.graph.floor import Floor
 from hovsg.dataloader.hm3dsem import HM3DSemDataset
 from hovsg.dataloader.scannet import ScannetDataset
 from hovsg.dataloader.replica import ReplicaDataset
+from hovsg.dataloader.real_robot import RealRobotDataset
 
 from hovsg.utils.clip_utils import get_img_feats, get_text_feats_multiple_templates
 from hovsg.models.sam_clip_feats_extractor import extract_feats_per_pixel
@@ -54,6 +55,7 @@ from hovsg.utils.graph_utils import (
 from hovsg.graph.navigation_graph import NavigationGraph
 from hovsg.utils.label_feats import get_label_feats
 from hovsg.utils.constants import MATTERPORT_GT_LABELS, CLIP_DIM
+from hovsg.utils.runtime_status import print_status
 from hovsg.utils.llm_utils import (
     parse_floor_room_object_gpt35,
     parse_hier_query,
@@ -81,10 +83,18 @@ class Graph:
         self.rooms = []
         self.floors = []
         self.full_feats_array = []
+        self.frame_indices = []
         self.graph = nx.Graph()
         self.graph.add_node(0, name="building", type="building")
         self.room_masks = {}
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print_status(
+            "RUNTIME_DEVICE",
+            "OK",
+            configured=self.cfg.main.get("device", "auto"),
+            selected=self.device,
+            cuda_available=torch.cuda.is_available(),
+        )
 
         # load CLIP model
         if self.cfg.models.clip.type == "ViT-L/14@336px":
@@ -103,13 +113,28 @@ class Graph:
             )
             self.clip_feat_dim = CLIP_DIM["ViT-H-14"]
         self.clip_model.eval()
+        print_status(
+            "CLIP_MODEL",
+            "OK",
+            model=self.cfg.models.clip.type,
+            checkpoint=self.cfg.models.clip.checkpoint,
+            feature_dim=self.clip_feat_dim,
+            device=self.device,
+        )
         if not hasattr(self.cfg, "pipeline"):
             print("-- entering querying and evaluation mode")
+            print_status("GRAPH_MODE", "INFO", mode="query_or_evaluation")
             return
 
         self.graph_tmp_folder = os.path.join(cfg.main.save_path, "tmp")
         if not os.path.exists(self.graph_tmp_folder):
             os.makedirs(self.graph_tmp_folder)
+        print_status(
+            "GRAPH_TEMP_DIRECTORY",
+            "OK",
+            path=self.graph_tmp_folder,
+            exists=os.path.isdir(self.graph_tmp_folder),
+        )
 
         # load the SAM model
         model_type = self.cfg.models.sam.type
@@ -127,6 +152,13 @@ class Graph:
             min_mask_region_area=self.cfg.models.sam.min_mask_region_area,
         )
         self.sam.eval()
+        print_status(
+            "SAM_MODEL",
+            "OK",
+            model=model_type,
+            checkpoint=self.cfg.models.sam.checkpoint,
+            device=self.device,
+        )
         # load the dataset
         dataset_cfg = {"root_dir": self.cfg.main.dataset_path, "transforms": None}
         if self.cfg.main.dataset == "hm3dsem":
@@ -135,30 +167,320 @@ class Graph:
             self.dataset = ScannetDataset(dataset_cfg)
         elif self.cfg.main.dataset == "replica":
             self.dataset = ReplicaDataset(dataset_cfg)
+        elif self.cfg.main.dataset == "real_robot":
+            # RealRobotDataset needs metric depth limits in addition to the
+            # common RGB-D dataset path. camera.json remains the fallback.
+            for key in ("min_depth_m", "max_depth_m"):
+                value = self.cfg.pipeline.get(key)
+                if value is not None:
+                    dataset_cfg[key] = value
+            self.dataset = RealRobotDataset(dataset_cfg)
         else:
-            print("Dataset not supported")
-            return
+            raise ValueError(f"Dataset not supported: {self.cfg.main.dataset}")
+        print_status(
+            "DATASET",
+            "OK",
+            name=self.cfg.main.dataset,
+            class_name=type(self.dataset).__name__,
+            root=self.cfg.main.dataset_path,
+            frames=len(self.dataset),
+        )
+
+    @staticmethod
+    def _validate_pose(pose):
+        """Validate a rigid 4x4 camera-to-map transform."""
+        pose = np.asarray(pose, dtype=np.float64)
+        if pose.shape != (4, 4):
+            return False, "pose_shape"
+        if not np.isfinite(pose).all():
+            return False, "pose_contains_nan_or_inf"
+        if not np.allclose(pose[3], [0.0, 0.0, 0.0, 1.0], atol=1e-6):
+            return False, "pose_last_row"
+
+        rotation = pose[:3, :3]
+        if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-2):
+            return False, "rotation_not_orthonormal"
+        if not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-2):
+            return False, "rotation_determinant"
+        return True, None
+
+    @staticmethod
+    def _pose_delta(previous_pose, current_pose):
+        """Return translation (m) and rotation (deg) between two poses."""
+        translation_m = np.linalg.norm(
+            current_pose[:3, 3] - previous_pose[:3, 3]
+        )
+        relative_rotation = previous_pose[:3, :3].T @ current_pose[:3, :3]
+        cosine = np.clip((np.trace(relative_rotation) - 1.0) / 2.0, -1.0, 1.0)
+        rotation_deg = np.degrees(np.arccos(cosine))
+        return float(translation_m), float(rotation_deg)
+
+    def _processing_frame_indices(self):
+        """Return accepted keyframes, or the configured stride as a fallback."""
+        if self.frame_indices:
+            return self.frame_indices
+        return list(range(0, len(self.dataset), self.cfg.pipeline.skip_frames))
 
     def create_feature_map(self, save_path=None):
         """
         Create the feature map of the HOV-SG (full point cloud + feature map point level + feature map mask level)
         :param save_path : str, optional, The path to save the feature map
+
+        ✅ 修改: 添加进度估算和定期保存机制
         """
 
         if self.dataset is None:
             print("No dataset loaded")
             return
 
+        candidate_frame_indices = list(
+            range(0, len(self.dataset), self.cfg.pipeline.skip_frames)
+        )
+        if not candidate_frame_indices:
+            raise RuntimeError("The dataset contains no frames to process")
+
+        # ========== 新增: 进度估算 ==========
+        estimated_time_per_frame = 4.0  # 秒/帧 (SAM+CLIP平均处理时间)
+        total_estimated_time = len(candidate_frame_indices) * estimated_time_per_frame
+
+        print("=" * 70)
+        print("📊 FEATURE MAP CREATION - PROGRESS ESTIMATION")
+        print("=" * 70)
+        print(f"  Total dataset frames: {len(self.dataset)}")
+        print(f"  Skip frames: {self.cfg.pipeline.skip_frames}")
+        print(f"  Candidate frames: {len(candidate_frame_indices)}")
+        print(f"  Estimated time per frame: {estimated_time_per_frame:.1f}s")
+        print(f"  ⏱️  Total estimated time: {total_estimated_time/60:.1f} minutes ({total_estimated_time/3600:.2f} hours)")
+        print(f"  💡 Tip: Increase skip_frames to reduce processing time")
+        print("=" * 70)
+        print()
+
+        voxel_size = float(self.cfg.pipeline.voxel_size)
+        fusion_batch_size = max(
+            1,
+            int(self.cfg.pipeline.get("pointcloud_fusion_batch_size", 10)),
+        )
+        keyframe_translation_m = max(
+            0.0,
+            float(self.cfg.pipeline.get("keyframe_translation_m", 0.0)),
+        )
+        keyframe_rotation_deg = max(
+            0.0,
+            float(self.cfg.pipeline.get("keyframe_rotation_deg", 0.0)),
+        )
+        max_pose_translation_jump_m = float(
+            self.cfg.pipeline.get("max_pose_translation_jump_m", np.inf)
+        )
+        max_pose_rotation_jump_deg = float(
+            self.cfg.pipeline.get("max_pose_rotation_jump_deg", np.inf)
+        )
+        if max_pose_translation_jump_m <= 0:
+            raise ValueError(
+                "pipeline.max_pose_translation_jump_m must be positive"
+            )
+        if max_pose_rotation_jump_deg <= 0:
+            raise ValueError(
+                "pipeline.max_pose_rotation_jump_deg must be positive"
+            )
+        association_distance_m = float(
+            self.cfg.pipeline.get(
+                "association_distance_m",
+                max(0.05, 2.0 * voxel_size),
+            )
+        )
+        if association_distance_m <= 0:
+            raise ValueError("pipeline.association_distance_m must be positive")
+
+        log_every_n_frames = max(
+            1,
+            int(self.cfg.pipeline.get("log_every_n_frames", 10)),
+        )
+        print_status(
+            "FEATURE_MAP",
+            "START",
+            dataset_frames=len(self.dataset),
+            candidate_frames=len(candidate_frame_indices),
+            skip_frames=self.cfg.pipeline.skip_frames,
+            voxel_size=voxel_size,
+            keyframe_translation_m=keyframe_translation_m,
+            keyframe_rotation_deg=keyframe_rotation_deg,
+            association_distance_m=association_distance_m,
+            fusion_batch_size=fusion_batch_size,
+            log_every_n_frames=log_every_n_frames,
+        )
+
         # create the RGB-D point cloud
-        for i in tqdm(range(0, len(self.dataset), self.cfg.pipeline.skip_frames), desc="Creating RGB-D point cloud"):
+        self.full_pcd = o3d.geometry.PointCloud()
+        self.frame_indices = []
+        last_accepted_pose = None
+        rejected_invalid_pose = 0
+        rejected_pose_jump = 0
+        rejected_non_keyframe = 0
+        raw_accumulated_points = 0
+        frames_since_downsample = 0
+        for candidate_position, i in enumerate(
+            tqdm(candidate_frame_indices, desc="Creating RGB-D point cloud")
+        ):
             rgb_image, depth_image, pose, _, depth_intrinsics = self.dataset[i]
-            self.full_pcd += self.dataset.create_pcd(rgb_image, depth_image, pose)
+            pose = np.asarray(pose, dtype=np.float64)
+            pose_valid, pose_error = self._validate_pose(pose)
+            if not pose_valid:
+                rejected_invalid_pose += 1
+                print_status(
+                    "POSE_FRAME",
+                    "WARN",
+                    frame_index=i,
+                    reason=pose_error,
+                )
+                continue
+
+            translation_delta_m = 0.0
+            rotation_delta_deg = 0.0
+            if last_accepted_pose is not None:
+                translation_delta_m, rotation_delta_deg = self._pose_delta(
+                    last_accepted_pose,
+                    pose,
+                )
+                if (
+                    translation_delta_m > max_pose_translation_jump_m
+                    or rotation_delta_deg > max_pose_rotation_jump_deg
+                ):
+                    rejected_pose_jump += 1
+                    print_status(
+                        "POSE_FRAME",
+                        "WARN",
+                        frame_index=i,
+                        reason="pose_jump",
+                        translation_delta_m=translation_delta_m,
+                        rotation_delta_deg=rotation_delta_deg,
+                    )
+                    continue
+
+                keyframe_required = (
+                    keyframe_translation_m > 0.0 or keyframe_rotation_deg > 0.0
+                )
+                translation_reached = (
+                    keyframe_translation_m > 0.0
+                    and translation_delta_m >= keyframe_translation_m
+                )
+                rotation_reached = (
+                    keyframe_rotation_deg > 0.0
+                    and rotation_delta_deg >= keyframe_rotation_deg
+                )
+                if keyframe_required and not (
+                    translation_reached or rotation_reached
+                ):
+                    rejected_non_keyframe += 1
+                    continue
+
+            frame_pcd = self.dataset.create_pcd(rgb_image, depth_image, pose)
+            self.frame_indices.append(i)
+            last_accepted_pose = pose.copy()
+            raw_accumulated_points += len(frame_pcd.points)
+            self.full_pcd += frame_pcd
+            frames_since_downsample += 1
+
+            if frames_since_downsample >= fusion_batch_size:
+                self.full_pcd = self.full_pcd.voxel_down_sample(
+                    voxel_size=voxel_size
+                )
+                frames_since_downsample = 0
+
+            should_log = (
+                len(self.frame_indices) == 1
+                or candidate_position == len(candidate_frame_indices) - 1
+                or len(self.frame_indices) % log_every_n_frames == 0
+            )
+            if should_log:
+                depth_array = np.asarray(depth_image)
+                if isinstance(self.dataset, RealRobotDataset):
+                    _, valid_depth = self.dataset.get_valid_depth_mask(depth_array)
+                else:
+                    valid_depth = np.isfinite(depth_array) & (depth_array > 0)
+                valid_depth_count = int(np.count_nonzero(valid_depth))
+                print_status(
+                    "POINT_CLOUD_FRAME",
+                    "OK",
+                    frame_index=i,
+                    progress=(
+                        f"{candidate_position + 1}/{len(candidate_frame_indices)}"
+                    ),
+                    accepted_keyframes=len(self.frame_indices),
+                    rgb_size=getattr(rgb_image, "size", np.asarray(rgb_image).shape),
+                    depth_shape=depth_array.shape,
+                    valid_depth_pixels=valid_depth_count,
+                    valid_depth_ratio=(
+                        valid_depth_count / valid_depth.size if valid_depth.size else 0.0
+                    ),
+                    frame_points=len(frame_pcd.points),
+                    raw_accumulated_points=raw_accumulated_points,
+                    resident_points=len(self.full_pcd.points),
+                    pose_translation=np.asarray(pose)[:3, 3].round(4).tolist(),
+                    translation_delta_m=translation_delta_m,
+                    rotation_delta_deg=rotation_delta_deg,
+                )
+
+        if not self.frame_indices:
+            raise RuntimeError(
+                "No frames passed pose validation and keyframe selection"
+            )
+        print_status(
+            "FRAME_SELECTION",
+            "OK",
+            candidate_frames=len(candidate_frame_indices),
+            accepted_keyframes=len(self.frame_indices),
+            rejected_invalid_pose=rejected_invalid_pose,
+            rejected_pose_jump=rejected_pose_jump,
+            rejected_non_keyframe=rejected_non_keyframe,
+        )
 
         # filter point cloud
+        resident_points_before_final_voxel = len(self.full_pcd.points)
         self.full_pcd = self.full_pcd.voxel_down_sample(
-            voxel_size=self.cfg.pipeline.voxel_size
+            voxel_size=voxel_size
         )
-        self.full_pcd = pcd_denoise_dbscan(self.full_pcd, eps=0.01, min_points=100)
+        voxel_points = len(self.full_pcd.points)
+        outlier_nb_neighbors = max(
+            2,
+            int(self.cfg.pipeline.get("outlier_nb_neighbors", 20)),
+        )
+        outlier_std_ratio = float(
+            self.cfg.pipeline.get("outlier_std_ratio", 2.0)
+        )
+        if outlier_std_ratio <= 0:
+            raise ValueError("pipeline.outlier_std_ratio must be positive")
+        if voxel_points > outlier_nb_neighbors:
+            self.full_pcd, _ = self.full_pcd.remove_statistical_outlier(
+                nb_neighbors=outlier_nb_neighbors,
+                std_ratio=outlier_std_ratio,
+            )
+        full_pcd_empty = self.full_pcd.is_empty()
+        print_status(
+            "FULL_POINT_CLOUD",
+            "ERROR" if full_pcd_empty else "OK",
+            raw_accumulated_points=raw_accumulated_points,
+            resident_points_before_final_voxel=resident_points_before_final_voxel,
+            voxel_points=voxel_points,
+            denoised_points=len(self.full_pcd.points),
+            denoise_method="statistical_outlier",
+            outlier_nb_neighbors=outlier_nb_neighbors,
+            outlier_std_ratio=outlier_std_ratio,
+            min_bound=(
+                []
+                if full_pcd_empty
+                else np.asarray(self.full_pcd.get_min_bound()).round(4).tolist()
+            ),
+            max_bound=(
+                []
+                if full_pcd_empty
+                else np.asarray(self.full_pcd.get_max_bound()).round(4).tolist()
+            ),
+        )
+        if full_pcd_empty:
+            raise RuntimeError(
+                "No valid 3D points were produced. Check the real-robot depth "
+                "units, depth range, intrinsics, and pose files."
+            )
 
         # create tree from full point cloud
         locs_in = np.array(self.full_pcd.points)
@@ -170,11 +492,15 @@ class Graph:
         # extract features for each frame
         frames_pcd = []
         frames_feats = []
-        for i in tqdm(range(0, len(self.dataset), self.cfg.pipeline.skip_frames), desc="Extracting features"):
+        association_attempts = 0
+        association_accepted = 0
+        for frame_position, i in enumerate(
+            tqdm(self.frame_indices, desc="Extracting features")
+        ):
             rgb_image, depth_image, pose, _, _ = self.dataset[i]
             if rgb_image.size != depth_image.size:
                 rgb_image = rgb_image.resize(depth_image.size)
-            F_2D, F_masks, masks, F_g = extract_feats_per_pixel(
+            feature_result = extract_feats_per_pixel(
                 np.array(rgb_image),
                 self.mask_generator,
                 self.clip_model,
@@ -183,6 +509,23 @@ class Graph:
                 bbox_margin=self.cfg.pipeline.clip_bbox_margin,
                 maskedd_weight=self.cfg.pipeline.clip_masked_weight,
             )
+            if feature_result is None or len(feature_result) != 4:
+                print_status(
+                    "SEMANTIC_FRAME",
+                    "WARN",
+                    frame_index=i,
+                    reason="feature_extractor_returned_no_complete_result",
+                )
+                continue
+            F_2D, F_masks, masks, F_g = feature_result
+            if F_2D is None or F_masks is None or masks is None:
+                print_status(
+                    "SEMANTIC_FRAME",
+                    "WARN",
+                    frame_index=i,
+                    reason="no_sam_masks",
+                )
+                continue
             F_2D = F_2D.cpu()
             pcd = self.dataset.create_pcd(rgb_image, depth_image, pose)
             masks_3d = self.dataset.create_3d_masks(
@@ -193,20 +536,99 @@ class Graph:
                 pose,
                 down_size=self.cfg.pipeline.voxel_size,
                 filter_distance=self.cfg.pipeline.max_mask_distance,
+                association_distance=association_distance_m,
             )
             frames_pcd.append(masks_3d)
             frames_feats.append(F_masks)
             # fuse features for each point in the full pcd
-            mask = np.array(depth_image) > 0
+            if isinstance(self.dataset, RealRobotDataset):
+                _, mask = self.dataset.get_valid_depth_mask(depth_image)
+            else:
+                mask = np.array(depth_image) > 0
             mask = torch.from_numpy(mask)
-            F_2D = F_2D[mask]
+            F_2D = F_2D[mask].to(dtype=torch.float32)
             # using cKdtree to find the closest point in the full pcd for each point in frame pcd
-            dis, idx = tree_pcd.query(np.asarray(pcd.points), k=1, workers=-1)
-            sum_features[idx] += F_2D
-            counter[idx] += 1
+            frame_points = np.asarray(pcd.points)
+            if frame_points.shape[0] != F_2D.shape[0]:
+                raise RuntimeError(
+                    "Point/feature count mismatch at frame "
+                    f"{i}: points={frame_points.shape[0]}, features={F_2D.shape[0]}"
+                )
+            if frame_points.shape[0] > 0:
+                dis, idx = tree_pcd.query(frame_points, k=1, workers=-1)
+                finite_feature = torch.isfinite(F_2D).all(dim=1)
+                nonzero_feature = torch.linalg.vector_norm(F_2D, dim=1) > 0
+                association_mask = (
+                    np.isfinite(dis) & (dis <= association_distance_m)
+                )
+                association_mask &= (finite_feature & nonzero_feature).numpy()
+                association_attempts += int(frame_points.shape[0])
+                association_accepted += int(np.count_nonzero(association_mask))
+
+                if np.any(association_mask):
+                    accepted_indices = torch.from_numpy(
+                        np.asarray(idx[association_mask], dtype=np.int64)
+                    )
+                    accepted_features = F_2D[
+                        torch.from_numpy(association_mask)
+                    ]
+                    sum_features.index_add_(
+                        0,
+                        accepted_indices,
+                        accepted_features,
+                    )
+                    counter.index_add_(
+                        0,
+                        accepted_indices,
+                        torch.ones(
+                            (accepted_indices.numel(), 1),
+                            dtype=counter.dtype,
+                        ),
+                    )
+
+            should_log = (
+                frame_position == 0
+                or frame_position == len(self.frame_indices) - 1
+                or (frame_position + 1) % log_every_n_frames == 0
+            )
+            if should_log:
+                mask_point_count = sum(len(mask_pcd.points) for mask_pcd in masks_3d)
+                print_status(
+                    "SEMANTIC_FRAME",
+                    "OK",
+                    frame_index=i,
+                    progress=f"{frame_position + 1}/{len(self.frame_indices)}",
+                    sam_masks=len(masks),
+                    mask_feature_shape=tuple(F_masks.shape),
+                    pixel_feature_shape=tuple(F_2D.shape),
+                    frame_points=len(pcd.points),
+                    associated_feature_points=(
+                        int(np.count_nonzero(association_mask))
+                        if frame_points.shape[0] > 0
+                        else 0
+                    ),
+                    masks_3d=len(masks_3d),
+                    masks_3d_points=mask_point_count,
+                )
+        if not frames_pcd:
+            print_status("SEMANTIC_EXTRACTION", "ERROR", reason="no_frames_processed")
+            raise RuntimeError("No frames produced SAM/CLIP features")
+        print_status(
+            "SEMANTIC_EXTRACTION",
+            "OK",
+            processed_frames=len(frames_pcd),
+            total_selected_frames=len(self.frame_indices),
+            association_attempts=association_attempts,
+            association_accepted=association_accepted,
+            association_ratio=(
+                association_accepted / association_attempts
+                if association_attempts
+                else 0.0
+            ),
+        )
         # compute the average features
-        counter[counter == 0] = 1e-5
-        sum_features = sum_features / counter
+        sum_features = sum_features / counter.clamp_min(1.0)
+        sum_features = torch.nn.functional.normalize(sum_features, p=2, dim=-1)
         self.full_feats_array = sum_features.cpu().numpy()
         self.full_feats_array: np.ndarray
         
@@ -215,6 +637,7 @@ class Graph:
         torch.cuda.empty_cache() 
 
         # merging the masks
+        masks_before_merge = sum(len(frame_masks) for frame_masks in frames_pcd)
         if self.cfg.pipeline.merge_type == "hierarchical":
             tqdm.write("Merging 3d masks hierarchically")
             self.mask_pcds = hierarchical_merge(
@@ -232,11 +655,26 @@ class Graph:
                 self.cfg.pipeline.voxel_size, 
                 self.cfg.pipeline.iou_thresh
             )
+        print_status(
+            "MASK_MERGE",
+            "OK",
+            merge_type=self.cfg.pipeline.merge_type,
+            masks_before=masks_before_merge,
+            masks_after=len(self.mask_pcds),
+        )
 
         # remove any small pcds
+        masks_before_size_filter = len(self.mask_pcds)
         for i, pcd in enumerate(self.mask_pcds):
             if pcd.is_empty() or len(pcd.points) < 100:
                 self.mask_pcds.pop(i)
+        print_status(
+            "MASK_SIZE_FILTER",
+            "OK",
+            masks_before=masks_before_size_filter,
+            masks_after=len(self.mask_pcds),
+            minimum_points=100,
+        )
         # fuse point features in every 3d mask
         masks_feats = []
         for i, mask_3d in tqdm(enumerate(self.mask_pcds), desc="Fusing features"):
@@ -258,12 +696,74 @@ class Graph:
         print("number of masks: ", len(self.mask_feats))
         print("number of pcds in hovsg: ", len(self.mask_pcds))
         assert len(self.mask_pcds) == len(self.mask_feats)
+        print_status(
+            "FEATURE_MAP",
+            "OK",
+            full_points=len(self.full_pcd.points),
+            full_feature_shape=tuple(self.full_feats_array.shape),
+            object_masks=len(self.mask_pcds),
+            mask_features=len(self.mask_feats),
+        )
 
     def segment_floors(self, path, flip_zy=False):
         """
         Segment the floors from the full point cloud
         :param path: str, The path to save the intermediate results
+
+        ✅ 修改: 添加单楼层检测fallback，适配室内移动机器人
         """
+        # ========== 新增: 单楼层检测 ==========
+        points = np.asarray(self.full_pcd.points)
+        y_min, y_max = points[:, 1].min(), points[:, 1].max()
+        y_range = y_max - y_min
+
+        print_status(
+            "FLOOR_DETECTION",
+            "INFO",
+            y_min=f"{y_min:.3f}m",
+            y_max=f"{y_max:.3f}m",
+            y_range=f"{y_range:.3f}m",
+        )
+
+        # 检查配置或自动判断是否为单楼层
+        min_floor_height = float(self.cfg.pipeline.get("min_floor_height", 0.5))
+        force_single_floor = bool(self.cfg.pipeline.get("force_single_floor", False))
+
+        if force_single_floor or y_range < min_floor_height:
+            print_status(
+                "FLOOR_DETECTION",
+                "OK",
+                mode="single_floor",
+                reason=f"Y-axis range ({y_range:.3f}m) < threshold ({min_floor_height:.3f}m)" if not force_single_floor else "force_single_floor=true",
+            )
+
+            # 创建单楼层
+            floor = Floor("0", name="floor_0")
+            floor.pcd = self.full_pcd
+            floor.floor_zero_level = y_min
+            floor.floor_height = y_range
+            floor.vertices = np.asarray(
+                self.full_pcd.get_axis_aligned_bounding_box().get_box_points()
+            )
+            self.floors.append(floor)
+
+            print_status(
+                "FLOOR_SEGMENTATION",
+                "OK",
+                floors=1,
+                floor_0_points=len(floor.pcd.points),
+                floor_0_height=f"{floor.floor_height:.3f}m",
+            )
+            return [floor]
+
+        # ========== 原有多楼层分割逻辑 ==========
+        print_status(
+            "FLOOR_DETECTION",
+            "INFO",
+            mode="multi_floor_detection",
+            message="Y-axis range sufficient for multi-floor detection",
+        )
+
         # downsample the point cloud
         downpcd = self.full_pcd.voxel_down_sample(voxel_size=0.05)
         # flip the z and y axis
@@ -380,6 +880,8 @@ class Graph:
         Segment the rooms from the floor point cloud
         :param floor: Floor, The floor object
         :param path: str, The path to save the intermediate results
+
+        ✅ 修改: 添加覆盖范围检查，避免数据不足时的分割失败
         """
 
         tmp_floor_path = os.path.join(self.graph_tmp_folder, floor.floor_id)
@@ -391,6 +893,64 @@ class Graph:
         xyz_full = xyz.copy()
         floor_zero_level = floor.floor_zero_level
         floor_height = floor.floor_height
+
+        # ========== 新增: 检查点云覆盖范围 ==========
+        x_range = xyz[:, 0].max() - xyz[:, 0].min()
+        z_range = xyz[:, 2].max() - xyz[:, 2].min()
+        coverage = min(x_range, z_range)
+        point_count = len(xyz)
+
+        print_status(
+            "ROOM_COVERAGE_CHECK",
+            "INFO",
+            floor_id=floor.floor_id,
+            x_range=f"{x_range:.2f}m",
+            z_range=f"{z_range:.2f}m",
+            min_coverage=f"{coverage:.2f}m",
+            points=point_count,
+        )
+
+        # 检查是否跳过房间分割
+        min_room_coverage = float(self.cfg.pipeline.get("min_room_coverage", 2.0))
+        skip_if_small = bool(self.cfg.pipeline.get("skip_room_segmentation_if_small", True))
+
+        if skip_if_small and (coverage < min_room_coverage or point_count < 1000):
+            print_status(
+                "ROOM_SEGMENTATION",
+                "SKIP",
+                floor_id=floor.floor_id,
+                reason=f"Insufficient coverage ({coverage:.2f}m < {min_room_coverage:.2f}m) or points ({point_count} < 1000)",
+                fallback="Creating single room for entire floor",
+            )
+
+            # 创建单个房间包含整个楼层
+            room = Room(f"{floor.floor_id}_0", floor.floor_id, name="room_0")
+            room.pcd = floor_pcd
+            room.vertices = xyz[:, [0, 2]]  # 2D vertices
+            room.room_height = floor_height
+            room.room_zero_level = floor_zero_level
+            room.embeddings = []
+            room.represent_images = []
+            self.rooms.append(room)
+            self.floors[int(floor.floor_id)].add_room(room)
+
+            print_status(
+                "ROOM_SEGMENTATION",
+                "OK",
+                floor_id=floor.floor_id,
+                rooms=1,
+                mode="single_room_fallback",
+            )
+            return
+
+        # ========== 原有房间分割逻辑 ==========
+        print_status(
+            "ROOM_SEGMENTATION",
+            "INFO",
+            floor_id=floor.floor_id,
+            mode="wall_based_segmentation",
+            message="Coverage sufficient for room segmentation",
+        )
         ## Slice below the ceiling ##
         xyz = xyz[xyz[:, 1] < floor_zero_level + floor_height - 0.3]
         xyz = xyz[xyz[:, 1] >= floor_zero_level + 1.5]
@@ -532,7 +1092,12 @@ class Graph:
         F_g_list = []
 
         all_global_clip_feats = dict()
-        for i, img_id in tqdm(enumerate(range(0, len(self.dataset), self.cfg.pipeline.skip_frames)), desc="Computing room features"):
+        processing_frame_indices = self._processing_frame_indices()
+        for i, img_id in tqdm(
+            enumerate(processing_frame_indices),
+            total=len(processing_frame_indices),
+            desc="Computing room features",
+        ):
             rgb_image, _, pose, _, _ = self.dataset[img_id]
             F_g = get_img_feats(np.array(rgb_image), self.preprocess, self.clip_model)
             all_global_clip_feats[str(img_id)] = F_g
@@ -567,7 +1132,9 @@ class Graph:
             room.room_height = floor_height
             room.room_zero_level = floor.floor_zero_level
             room.embeddings = repr_embs_list[i]
-            room.represent_images = [int(k * self.cfg.pipeline.skip_frames) for k in repr_img_ids_list[i]]
+            room.represent_images = [
+                int(processing_frame_indices[k]) for k in repr_img_ids_list[i]
+            ]
             self.rooms.append(room)
             room_index += 1
         print(
@@ -741,6 +1308,17 @@ class Graph:
                 topo_obj.save(os.path.join(path, "rooms"))
             elif type(topo_obj) == Object:
                 topo_obj.save(os.path.join(path, "objects"))
+        print_status(
+            "SAVE_HIERARCHICAL_GRAPH",
+            "OK",
+            path=path,
+            floors=len(self.floors),
+            rooms=len(self.rooms),
+            objects=len(self.objects),
+            floor_files=len(os.listdir(os.path.join(path, "floors"))),
+            room_files=len(os.listdir(os.path.join(path, "rooms"))),
+            object_files=len(os.listdir(os.path.join(path, "objects"))),
+        )
 
     def load_graph(self, path):
         """
@@ -810,15 +1388,39 @@ class Graph:
         Build the HOV-SG, by segmenting the floors, rooms, and objects and creating the graph.
         :param save_path: str, The path to save the intermediate results
         """
+        print_status(
+            "GRAPH_BUILD",
+            "START",
+            save_path=save_path,
+            full_points=len(self.full_pcd.points),
+            object_masks=len(self.mask_pcds),
+        )
         print("segmenting floors...")
+        print_status("FLOOR_SEGMENTATION", "START", input_points=len(self.full_pcd.points))
         self.segment_floors(save_path)
+        print_status("FLOOR_SEGMENTATION", "OK", floors=len(self.floors))
 
         print("segmenting rooms...")
         for floor in self.floors:
+            print_status(
+                "ROOM_SEGMENTATION",
+                "START",
+                floor_id=floor.floor_id,
+                floor_points=len(floor.pcd.points),
+            )
             self.segment_rooms(floor, save_path)
+            print_status(
+                "ROOM_SEGMENTATION",
+                "OK",
+                floor_id=floor.floor_id,
+                floor_rooms=len(floor.rooms),
+                total_rooms=len(self.rooms),
+            )
 
         print("segmenting/identifying objects...")
+        print_status("OBJECT_SEGMENTATION", "START", masks=len(self.mask_pcds))
         self.segment_objects(save_path)
+        print_status("OBJECT_SEGMENTATION", "OK", objects=len(self.objects))
 
         print("number of objects: ", len(self.objects))
         if self.cfg.pipeline.merge_objects_graph:
@@ -831,12 +1433,32 @@ class Graph:
 
         print("creating graph...")
         self.create_graph()
+        print_status(
+            "NETWORKX_GRAPH",
+            "OK",
+            nodes=self.graph.number_of_nodes(),
+            edges=self.graph.number_of_edges(),
+        )
 
         # create navigation graph for each floor
+        print_status("NAVIGATION_GRAPH", "START", floors=len(self.floors))
         self.create_nav_graph()
+        print_status(
+            "NAVIGATION_GRAPH",
+            "OK",
+            path=os.path.join(self.cfg.main.save_path, "graph", "nav_graph"),
+        )
 
         # save the graph
         self.save_graph(os.path.join(save_path, "graph"))
+        print_status(
+            "GRAPH_BUILD",
+            "OK",
+            floors=len(self.floors),
+            rooms=len(self.rooms),
+            objects=len(self.objects),
+            path=os.path.join(save_path, "graph"),
+        )
 
         print("# floors: ", len(self.floors))
         print("# rooms: ", len(self.rooms))
@@ -856,11 +1478,18 @@ class Graph:
 
         # get pose list
         poses_list = []
-        for i in range(0, len(self.dataset), self.cfg.pipeline.skip_frames):
+        for i in self._processing_frame_indices():
             _, _, pose, _, _ = self.dataset[i]
             poses_list.append(pose)
 
         for floor_id, floor in enumerate(self.floors):
+            print_status(
+                "NAVIGATION_FLOOR",
+                "START",
+                floor_id=floor_id,
+                floor_points=len(floor.pcd.points),
+                poses=len(poses_list),
+            )
             nav_graph = NavigationGraph(floor.pcd, cell_size=0.03)
             upperbound = None
             if floor_id + 1 < len(self.floors):
@@ -881,6 +1510,16 @@ class Graph:
             NavigationGraph.save_voronoi_graph(
                 sparse_floor_voronoi, nav_dir, "sparse_voronoi"
             )
+            print_status(
+                "NAVIGATION_FLOOR",
+                "OK",
+                floor_id=floor_id,
+                floor_poses=len(floor_poses_list),
+                nodes=sparse_floor_voronoi.number_of_nodes(),
+                edges=sparse_floor_voronoi.number_of_edges(),
+                has_stairs=sparse_stairs_voronoi is not None,
+                output_directory=nav_dir,
+            )
 
             if last_nav_graph is not None and last_nav_graph.has_stairs:
                 print(f"connecting two floors {floor_id}")
@@ -893,6 +1532,13 @@ class Graph:
             global_voronoi = last_nav_graph.sparse_floor_voronoi
 
         NavigationGraph.save_voronoi_graph(global_voronoi, nav_dir, "global_nav_graph")
+        print_status(
+            "NAVIGATION_GLOBAL",
+            "OK",
+            nodes=global_voronoi.number_of_nodes(),
+            edges=global_voronoi.number_of_edges(),
+            output_directory=nav_dir,
+        )
 
     def generate_room_names(
         self,
@@ -1230,8 +1876,16 @@ class Graph:
         """
         if not os.path.exists(path):
             os.makedirs(path)
-        o3d.io.write_point_cloud(os.path.join(path, "full_pcd.ply"), self.full_pcd)
+        output_path = os.path.join(path, "full_pcd.ply")
+        success = o3d.io.write_point_cloud(output_path, self.full_pcd)
         print("full pcd saved to disk in {}".format(path))
+        print_status(
+            "SAVE_FULL_POINT_CLOUD",
+            "OK" if success else "ERROR",
+            path=output_path,
+            points=len(self.full_pcd.points),
+            exists=os.path.exists(output_path),
+        )
         return None
 
     def load_full_pcd(self, path):
@@ -1258,17 +1912,29 @@ class Graph:
         if not os.path.exists(path):
             os.makedirs(path)
         # check if the full pcd feats is empty list
+        saved_outputs = []
         if len(self.mask_feats) != 0:
             self.mask_feats = np.array(self.mask_feats)
+            mask_feats_path = os.path.join(path, "mask_feats.pt")
             torch.save(
-                torch.from_numpy(self.mask_feats), os.path.join(path, "mask_feats.pt")
+                torch.from_numpy(self.mask_feats), mask_feats_path
             )
+            saved_outputs.append(mask_feats_path)
         if len(self.full_feats_array) != 0:
+            full_feats_path = os.path.join(path, "full_feats.pt")
             torch.save(
                 torch.from_numpy(self.full_feats_array),
-                os.path.join(path, "full_feats.pt"),
+                full_feats_path,
             )
+            saved_outputs.append(full_feats_path)
         print("full pcd feats saved to disk in {}".format(path))
+        print_status(
+            "SAVE_FEATURES",
+            "OK" if saved_outputs and all(os.path.exists(item) for item in saved_outputs) else "WARN",
+            outputs=saved_outputs,
+            mask_feature_shape=getattr(self.mask_feats, "shape", None),
+            full_feature_shape=getattr(self.full_feats_array, "shape", None),
+        )
         return None
 
     def load_full_pcd_feats(self, path, full_feats=False, normalize=True):
@@ -1350,17 +2016,36 @@ class Graph:
                 os.makedirs(objects_path)
             print("number of masked pcds: ", len(self.mask_pcds))
             print("number of mask_feats: ", len(self.mask_feats))
+            object_write_results = []
             for i, pcd in enumerate(self.mask_pcds):
-                o3d.io.write_point_cloud(
-                    os.path.join(objects_path, "pcd_{}.ply".format(i)), pcd
+                object_path = os.path.join(objects_path, "pcd_{}.ply".format(i))
+                object_write_results.append(
+                    o3d.io.write_point_cloud(object_path, pcd)
                 )
 
             masked_pcd = o3d.geometry.PointCloud()
             for pcd in self.mask_pcds:
                 pcd.paint_uniform_color(np.random.rand(3))
                 masked_pcd += pcd
-            o3d.io.write_point_cloud(os.path.join(path, "masked_pcd.ply"), masked_pcd)
+            masked_output_path = os.path.join(path, "masked_pcd.ply")
+            masked_write_success = o3d.io.write_point_cloud(
+                masked_output_path, masked_pcd
+            )
             print("masked pcds saved to disk in {}".format(path))
+            print_status(
+                "SAVE_MASKED_POINT_CLOUDS",
+                (
+                    "OK"
+                    if masked_write_success and all(object_write_results)
+                    else "ERROR"
+                ),
+                directory=objects_path,
+                object_files=len(object_write_results),
+                successful_object_files=sum(object_write_results),
+                combined_path=masked_output_path,
+                combined_points=len(masked_pcd.points),
+                exists=os.path.exists(masked_output_path),
+            )
 
         elif state == "objects":
             if not os.path.exists(path):
