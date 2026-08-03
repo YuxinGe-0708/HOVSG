@@ -7,6 +7,11 @@ import open3d as o3d
 from PIL import Image
 
 from hovsg.dataloader.generic import RGBDDataset
+from hovsg.utils.pose_utils import (
+    as_pose_matrix,
+    camera_tilt_deg_y_up,
+    project_camera_pose_to_planar_y_up,
+)
 from hovsg.utils.runtime_status import print_status
 
 
@@ -114,11 +119,17 @@ class RealRobotDataset(RGBDDataset):
         # RGBDDataset uses scale when projecting 2D masks. Keep the alias for
         # compatibility; real-robot conversion uses meters_per_unit explicitly.
         self.scale = self.depth_units_per_meter
+        configured_min_depth = cfg.get("min_depth_m")
+        configured_max_depth = cfg.get("max_depth_m")
         self.min_depth_m = float(
-            cfg.get("min_depth_m", camera.get("min_depth_m", 0.2))
+            camera.get("min_depth_m", 0.2)
+            if configured_min_depth is None
+            else configured_min_depth
         )
         self.max_depth_m = float(
-            cfg.get("max_depth_m", camera.get("max_depth_m", 5.0))
+            camera.get("max_depth_m", 5.0)
+            if configured_max_depth is None
+            else configured_max_depth
         )
         if self.min_depth_m < 0 or self.max_depth_m <= self.min_depth_m:
             raise ValueError(
@@ -126,6 +137,40 @@ class RealRobotDataset(RGBDDataset):
                 f"min_depth_m={self.min_depth_m}, max_depth_m={self.max_depth_m}"
             )
         self.world_frame = camera.get("world_frame", "hov_y_up")
+        self.pose_convention = camera.get(
+            "pose_convention", "T_world_camera_optical"
+        )
+        if self.pose_convention not in {
+            "T_world_camera_optical",
+            "T_global_camera_optical",
+        }:
+            raise ValueError(
+                f"Unsupported pose_convention: {self.pose_convention!r}"
+            )
+        self.pose_mode = str(cfg.get("pose_mode", "raw")).strip().lower()
+        if self.pose_mode not in {"raw", "planar"}:
+            raise ValueError("pose_mode must be either 'raw' or 'planar'")
+
+        first_pose = self._convert_pose_to_hov(
+            self._read_pose_matrix(self.data_list[0][2])
+        )
+        configured_height = cfg.get("planar_pose_height_m")
+        self.planar_pose_height_m = (
+            float(configured_height)
+            if configured_height is not None
+            else float(first_pose[1, 3])
+        )
+        self.pose_warn_tilt_deg = float(cfg.get("pose_warn_tilt_deg", 5.0))
+        self.pose_warn_height_drift_m = float(
+            cfg.get("pose_warn_height_drift_m", 0.15)
+        )
+        self._pose_diagnostics = {
+            "poses_loaded": 0,
+            "max_raw_tilt_deg": 0.0,
+            "max_raw_height_drift_m": 0.0,
+            "tilt_warning_frames": 0,
+            "height_warning_frames": 0,
+        }
 
         self.distortion_model = str(camera.get("distortion_model", ""))
         distortion = camera.get("distortion_coefficients", [])
@@ -174,6 +219,9 @@ class RealRobotDataset(RGBDDataset):
             min_depth_m=self.min_depth_m,
             max_depth_m=self.max_depth_m,
             world_frame=self.world_frame,
+            pose_convention=self.pose_convention,
+            pose_mode=self.pose_mode,
+            planar_pose_height_m=self.planar_pose_height_m,
             distortion_model=self.distortion_model,
             image_rectified=self.image_rectified,
         )
@@ -202,9 +250,25 @@ class RealRobotDataset(RGBDDataset):
                 f"rgb={len(rgb_ids)}, depth={len(depth_ids)}, pose={len(pose_ids)}"
             )
 
+        valid_ids_path = root / "valid_frame_ids.txt"
+        if valid_ids_path.is_file():
+            selected_ids = {
+                line.strip()
+                for line in valid_ids_path.read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            }
+            unknown_ids = selected_ids - rgb_ids
+            if unknown_ids:
+                raise ValueError(
+                    f"{valid_ids_path} contains unknown frame IDs: "
+                    f"{sorted(unknown_ids)[:5]}"
+                )
+        else:
+            selected_ids = rgb_ids
+
         frame_ids = sorted(
-            rgb_ids,
-            key=lambda value: int(value) if value.isdigit() else value,
+            selected_ids,
+            key=lambda value: (0, int(value)) if value.isdigit() else (1, value),
         )
 
         if not frame_ids:
@@ -367,27 +431,41 @@ class RealRobotDataset(RGBDDataset):
         return pcd
 
     def _load_pose(self, path):
-        pose = np.loadtxt(path, dtype=np.float64)
+        pose = self._convert_pose_to_hov(self._read_pose_matrix(path))
+        raw_tilt_deg = camera_tilt_deg_y_up(pose)
+        raw_height_drift_m = abs(
+            float(pose[1, 3]) - self.planar_pose_height_m
+        )
+        diagnostics = self._pose_diagnostics
+        diagnostics["poses_loaded"] += 1
+        diagnostics["max_raw_tilt_deg"] = max(
+            diagnostics["max_raw_tilt_deg"], raw_tilt_deg
+        )
+        diagnostics["max_raw_height_drift_m"] = max(
+            diagnostics["max_raw_height_drift_m"], raw_height_drift_m
+        )
+        if raw_tilt_deg > self.pose_warn_tilt_deg:
+            diagnostics["tilt_warning_frames"] += 1
+        if raw_height_drift_m > self.pose_warn_height_drift_m:
+            diagnostics["height_warning_frames"] += 1
 
-        if pose.size != 16:
-            raise ValueError(f"Pose must contain 16 numbers: {path}")
+        if self.pose_mode == "planar":
+            pose = project_camera_pose_to_planar_y_up(
+                pose,
+                height_m=self.planar_pose_height_m,
+            )
+        return pose
 
-        pose = pose.reshape(4, 4)
+    def load_pose(self, path):
+        """Load one source pose using this dataset's frame conversion policy."""
+        return self._load_pose(path)
 
-        if not np.isfinite(pose).all():
-            raise ValueError(f"Pose contains NaN or Inf: {path}")
+    @staticmethod
+    def _read_pose_matrix(path):
+        return as_pose_matrix(np.loadtxt(path, dtype=np.float64), name=str(path))
 
-        if not np.allclose(pose[3], [0, 0, 0, 1], atol=1e-6):
-            raise ValueError(f"Invalid pose last row: {path}")
-
-        rotation = pose[:3, :3]
-        if not np.allclose(
-            rotation.T @ rotation,
-            np.eye(3),
-            atol=1e-2,
-        ):
-            raise ValueError(f"Invalid rotation matrix: {path}")
-
+    def _convert_pose_to_hov(self, pose):
+        pose = pose.copy()
         if self.world_frame == "ros_z_up":
             pose = ROS_Z_UP_TO_HOV_Y_UP @ pose
         elif self.world_frame == "camera_optical_initial":
@@ -396,5 +474,8 @@ class RealRobotDataset(RGBDDataset):
             pose = conversion @ pose
         elif self.world_frame != "hov_y_up":
             raise ValueError(f"Unknown world frame: {self.world_frame}")
-
         return pose
+
+    def get_pose_diagnostics(self):
+        """Return accumulated raw-pose drift statistics."""
+        return dict(self._pose_diagnostics)

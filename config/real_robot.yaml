@@ -48,6 +48,12 @@ pipeline:
   # Reject discontinuous localization poses instead of corrupting the map.
   max_pose_translation_jump_m: 0.75
   max_pose_rotation_jump_deg: 45.0
+  # Flat-floor robots should use planar mode. It preserves X/Z and yaw while
+  # fixing camera height and removing visual-odometry roll/pitch drift.
+  pose_mode: planar # raw, planar
+  planar_pose_height_m: null # null uses the first valid camera pose height
+  pose_warn_tilt_deg: 5.0
+  pose_warn_height_drift_m: 0.15
   # Downsample the accumulated point cloud every N accepted keyframes.
   pointcloud_fusion_batch_size: 10
   log_every_n_frames: 1 # print progress every n frames

@@ -62,6 +62,16 @@ def main(params: DictConfig):
             "transforms": None,
             "min_depth_m": params.pipeline.get("min_depth_m"),
             "max_depth_m": params.pipeline.get("max_depth_m"),
+            "pose_mode": params.pipeline.get("pose_mode", "raw"),
+            "planar_pose_height_m": params.pipeline.get(
+                "planar_pose_height_m"
+            ),
+            "pose_warn_tilt_deg": params.pipeline.get(
+                "pose_warn_tilt_deg", 5.0
+            ),
+            "pose_warn_height_drift_m": params.pipeline.get(
+                "pose_warn_height_drift_m", 0.15
+            ),
         }
     )
 
@@ -235,6 +245,7 @@ def main(params: DictConfig):
         final_points=len(full_pcd.points),
         min_bound=np.asarray(full_pcd.get_min_bound()).round(4).tolist(),
         max_bound=np.asarray(full_pcd.get_max_bound()).round(4).tolist(),
+        raw_pose_diagnostics=dataset.get_pose_diagnostics(),
     )
 
 

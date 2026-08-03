@@ -170,7 +170,14 @@ class Graph:
         elif self.cfg.main.dataset == "real_robot":
             # RealRobotDataset needs metric depth limits in addition to the
             # common RGB-D dataset path. camera.json remains the fallback.
-            for key in ("min_depth_m", "max_depth_m"):
+            for key in (
+                "min_depth_m",
+                "max_depth_m",
+                "pose_mode",
+                "planar_pose_height_m",
+                "pose_warn_tilt_deg",
+                "pose_warn_height_drift_m",
+            ):
                 value = self.cfg.pipeline.get(key)
                 if value is not None:
                     dataset_cfg[key] = value
@@ -316,6 +323,7 @@ class Graph:
         rejected_invalid_pose = 0
         rejected_pose_jump = 0
         rejected_non_keyframe = 0
+        rejected_empty_pointcloud = 0
         raw_accumulated_points = 0
         frames_since_downsample = 0
         for candidate_position, i in enumerate(
@@ -374,6 +382,15 @@ class Graph:
                     continue
 
             frame_pcd = self.dataset.create_pcd(rgb_image, depth_image, pose)
+            if frame_pcd.is_empty():
+                rejected_empty_pointcloud += 1
+                print_status(
+                    "POINT_CLOUD_FRAME",
+                    "WARN",
+                    frame_index=i,
+                    reason="empty_point_cloud",
+                )
+                continue
             self.frame_indices.append(i)
             last_accepted_pose = pose.copy()
             raw_accumulated_points += len(frame_pcd.points)
@@ -432,6 +449,7 @@ class Graph:
             rejected_invalid_pose=rejected_invalid_pose,
             rejected_pose_jump=rejected_pose_jump,
             rejected_non_keyframe=rejected_non_keyframe,
+            rejected_empty_pointcloud=rejected_empty_pointcloud,
         )
 
         # filter point cloud
