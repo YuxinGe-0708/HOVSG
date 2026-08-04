@@ -1,0 +1,105 @@
+# 真机完整轨迹建图配置
+# 针对室内移动机器人优化
+# 相机: Aurora 930 (320x200, depth 0.15-4.0m)
+# 世界坐标系: camera_optical_initial
+# 建图类型: 单楼层语义地图 + 导航图
+
+main:
+  device: cuda
+  dataset: real_robot
+  scene_id: trajectory_full  # 修改为实际场景名称
+  split: test
+
+  # 根据实际路径修改
+  package_path: C:/Users/Lenovo/Documents/Codex/2026-07-24/a-m/HOV-SG-graph-dev/hovsg
+  dataset_path: C:/Users/Lenovo/Desktop  # 数据集父目录
+  save_path: C:/Users/Lenovo/Desktop/outputs  # 输出目录
+
+models:
+  clip:
+    type: ViT-H-14  # 高质量特征提取
+    checkpoint: checkpoints/laion2b_s32b_b79k.bin
+
+  sam:
+    type: vit_h
+    checkpoint: checkpoints/sam_vit_h_4b8939.pth
+    # ✅ 优化SAM参数以平衡质量和速度
+    points_per_side: 10           # 从12降到10 (减少mask数量，加快速度)
+    pred_iou_thresh: 0.90         # 从0.88提高到0.90 (提高mask质量)
+    points_per_batch: 144
+    crop_n_layers: 0
+    stability_score_thresh: 0.95
+    min_mask_region_area: 150     # 从100提高到150 (过滤小物体，减少噪声)
+
+pipeline:
+  # ✅ 关键修改1: 开启所有建图功能
+  extract_semantics: true   # 开启SAM+CLIP语义提取
+  create_graph: true        # 开启楼层/房间/物体分割
+  create_navigation: true   # 开启导航图生成
+
+  # ✅ 关键修改2: 优化点云融合参数
+  voxel_size: 0.04          # 从0.03提高到0.04 (减少点数，加快处理)
+  skip_frames: 3            # 从1改为3 (跳帧处理，3倍加速)
+
+  # ✅ 关键修改3: 降低关键帧阈值 (适应真机运动)
+  keyframe_translation_m: 0.05   # 从0.10降低到0.05 (更密集采样)
+  keyframe_rotation_deg: 5.0     # 从10.0降低到5.0 (捕捉更多视角)
+
+  # ✅ 关键修改4: 位姿跳变检测 (防止SLAM失效)
+  max_pose_translation_jump_m: 0.5   # 从0.75降低到0.5 (更严格)
+  max_pose_rotation_jump_deg: 30.0   # 从45.0降低到30.0 (更严格)
+
+  # ✅ 关键修改5: 优化融合批次
+  pointcloud_fusion_batch_size: 5   # 从10降低到5 (更频繁降采样)
+  log_every_n_frames: 5             # 从1改为5 (减少日志输出)
+  min_pcd_points: 50                # 从30提高到50 (过滤小点云)
+
+  # ✅ 关键修改6: 深度过滤优化 (针对Aurora 930)
+  min_depth_m: 0.20         # 从0.15提高到0.20 (减少近距噪声)
+  max_depth_m: 3.5          # 从4.0降低到3.5 (减少远距不准)
+  association_distance_m: 0.08  # 从0.05提高到0.08 (增大容差)
+
+  # ✅ 关键修改7: 增强去噪
+  outlier_nb_neighbors: 30  # 从20提高到30 (更强去噪)
+  outlier_std_ratio: 2.5    # 从2.0提高到2.5 (更强去噪)
+
+  # Mask合并参数
+  init_overlap_thresh: 0.75
+  overlap_thresh_factor: 0.025
+  iou_thresh: 0.05
+
+  # CLIP特征参数
+  clip_masked_weight: 0.4418
+  clip_bbox_margin: 50
+  feature_dbscan_eps: 0.01
+  max_mask_distance: 5.0
+  depth_weighting: false
+
+  # ✅ 关键修改8: 房间分割参数优化
+  grid_resolution: 0.08     # 从0.05提高到0.08 (粗粒度，更鲁棒)
+  merge_type: sequential    # 保持sequential (更快)
+  save_intermediate_results: true  # 保存中间结果便于调试
+  obj_labels: HM3DSEM_LABELS
+  merge_objects_graph: false
+
+  # ✅ 新增配置: 单楼层模式
+  force_single_floor: true   # 强制单楼层处理
+  min_floor_height: 0.5      # 最小楼层高度差 (m)
+  skip_room_segmentation_if_small: true  # 覆盖范围小时跳过房间分割
+  min_room_coverage: 2.0     # 最小房间覆盖范围 (m)
+
+robot:
+  # ✅ 真机参数 (根据实际情况)
+  camera_height_m: 1.05      # 相机离地高度
+  radius_m: 0.28             # 机器人半径
+  safety_margin_m: 0.15      # 从0.10提高到0.15 (更安全)
+
+navigation:
+  cell_size_m: 0.05          # 导航网格分辨率
+  min_clearance_m: 0.40      # 最小通行间隙 (robot_radius + safety * 2)
+
+# ✅ 性能优化建议
+performance:
+  estimated_time_per_frame: 4.0  # 秒/帧 (用于估算总时间)
+  enable_progress_save: true     # 启用定期保存 (防止中断)
+  save_checkpoint_every_n_frames: 50  # 每50帧保存一次检查点

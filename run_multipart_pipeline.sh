@@ -31,7 +31,8 @@ export PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 echo "[1/4] Validating capture parts"
 "$PYTHON_BIN" tools/multipart_capture.py validate-room \
     --room-dir "$PARTS_DIR" \
-    --part-names "${PART_NAMES[@]}"
+    --part-names "${PART_NAMES[@]}" \
+    --require-timestamps
 
 echo "[2/4] Registering adjacent overlap windows"
 "$PYTHON_BIN" tools/align_pointclouds.py \

@@ -233,7 +233,6 @@ class Graph:
         Create the feature map of the HOV-SG (full point cloud + feature map point level + feature map mask level)
         :param save_path : str, optional, The path to save the feature map
 
-        ✅ 修改: 添加进度估算和定期保存机制
         """
 
         if self.dataset is None:

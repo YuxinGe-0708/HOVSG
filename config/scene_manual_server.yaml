@@ -1,0 +1,100 @@
+# 服务器建图配置 - scene_manual_20260731_113213
+# 数据：3982帧完整轨迹
+# 服务器路径：/mnt/data/huangyixuan/isaac/HOV-SG-graph-dev-v2
+
+main:
+  device: cuda
+  dataset: real_robot
+  scene_id: scene_manual
+  split: test
+
+  # 服务器路径配置
+  package_path: /mnt/data/huangyixuan/isaac/HOV-SG-graph-dev-v2/hovsg
+  dataset_path: /mnt/data/huangyixuan/isaac/HOV-SG-graph-dev-v2/data
+  save_path: /mnt/data/huangyixuan/isaac/HOV-SG-graph-dev-v2/outputs/scene_manual
+
+models:
+  clip:
+    type: ViT-H-14
+    checkpoint: /mnt/data/huangyixuan/isaac/HOV-SG-graph-dev-v2/checkpoints/laion2b_s32b_b79k.bin
+
+  sam:
+    type: vit_h
+    checkpoint: /mnt/data/huangyixuan/isaac/HOV-SG-graph-dev-v2/checkpoints/sam_vit_h_4b8939.pth
+    points_per_side: 10
+    pred_iou_thresh: 0.90
+    points_per_batch: 144
+    crop_n_layers: 0
+    stability_score_thresh: 0.95
+    min_mask_region_area: 150
+
+pipeline:
+  # ✅ 开启所有建图功能
+  extract_semantics: true
+  create_graph: true
+  create_navigation: true
+
+  # ✅ 针对3982帧优化
+  voxel_size: 0.04
+  skip_frames: 5  # 3982帧 -> 约797帧候选
+
+  # 关键帧选择
+  keyframe_translation_m: 0.05
+  keyframe_rotation_deg: 5.0
+
+  # 位姿跳变检测
+  max_pose_translation_jump_m: 0.5
+  max_pose_rotation_jump_deg: 30.0
+
+  # 点云融合
+  pointcloud_fusion_batch_size: 5
+  log_every_n_frames: 10
+  min_pcd_points: 50
+
+  # 深度过滤（Aurora 930相机）
+  min_depth_m: 0.20
+  max_depth_m: 3.5
+  association_distance_m: 0.08
+
+  # 去噪
+  outlier_nb_neighbors: 30
+  outlier_std_ratio: 2.5
+
+  # Mask合并
+  init_overlap_thresh: 0.75
+  overlap_thresh_factor: 0.025
+  iou_thresh: 0.05
+
+  # CLIP特征
+  clip_masked_weight: 0.4418
+  clip_bbox_margin: 50
+  feature_dbscan_eps: 0.01
+  max_mask_distance: 5.0
+  depth_weighting: false
+
+  # 房间分割
+  grid_resolution: 0.08
+  merge_type: sequential
+  save_intermediate_results: true
+  obj_labels: HM3DSEM_LABELS
+  merge_objects_graph: false
+
+  # ✅ 单楼层和房间分割配置
+  force_single_floor: true
+  min_floor_height: 0.5
+  skip_room_segmentation_if_small: true
+  min_room_coverage: 2.0
+
+robot:
+  camera_height_m: 1.05
+  radius_m: 0.28
+  safety_margin_m: 0.15
+
+navigation:
+  cell_size_m: 0.05
+  min_clearance_m: 0.40
+
+# 处理时间估算：
+# 候选帧数：3982 / 5 = 797帧
+# 估算时间：797 × 4秒 = 53分钟
+# 实际可能：45-70分钟（取决于GPU）

@@ -185,6 +185,31 @@ def validate_part(part_dir, *, require_frame_metadata=False):
                 f"{metadata_path} is missing frame IDs: "
                 f"{sorted(missing_metadata, key=_frame_sort_key)[:5]}"
             )
+        if require_frame_metadata:
+            timestamp_fields = (
+                "rgb_timestamp_ns",
+                "depth_timestamp_ns",
+                "pose_timestamp_ns",
+            )
+            for frame_id in frame_ids:
+                row = metadata[frame_id]
+                for field in timestamp_fields:
+                    value = str(row.get(field, "")).strip()
+                    if not value:
+                        raise ValueError(
+                            f"{metadata_path} has an empty {field} for {frame_id}"
+                        )
+                    try:
+                        timestamp_ns = int(value)
+                    except ValueError as error:
+                        raise ValueError(
+                            f"{metadata_path} has a non-integer {field} for "
+                            f"{frame_id}: {value!r}"
+                        ) from error
+                    if timestamp_ns < 0:
+                        raise ValueError(
+                            f"{metadata_path} has a negative {field} for {frame_id}"
+                        )
 
     return PartData(
         name=root.name,
@@ -214,6 +239,8 @@ def camera_signature(camera):
         "distortion_model",
         "distortion_coefficients",
         "image_rectified",
+        "camera_frame_axes",
+        "pose_convention",
     ]
     return {key: camera.get(key) for key in keys}
 
