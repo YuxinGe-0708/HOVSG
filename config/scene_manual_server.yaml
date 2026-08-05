@@ -11,7 +11,7 @@ main:
   # 服务器路径配置
   package_path: /mnt/data/huangyixuan/isaac/HOV-SG-graph-dev-multi-part/hovsg
   dataset_path: /mnt/data/huangyixuan/isaac/robot_recordings
-  save_path: /mnt/data/huangyixuan/isaac/hovsg_outputs/planar_checks
+  save_path: /mnt/data/huangyixuan/isaac/hovsg_outputs/planar_checks_v2
 
 models:
   clip:
@@ -49,9 +49,12 @@ pipeline:
   pose_warn_tilt_deg: 5.0
   pose_warn_height_drift_m: 0.15
 
-  # 位姿跳变检测
-  max_pose_translation_jump_m: 0.5
-  max_pose_rotation_jump_deg: 30.0
+  # This recording contains a 1.78 m online RTAB-Map correction. Keep it in
+  # this diagnostic build so later frames are not all rejected against the
+  # last pre-correction keyframe. This does not replace final pose-graph
+  # optimization.
+  max_pose_translation_jump_m: 2.0
+  max_pose_rotation_jump_deg: 45.0
 
   # 点云融合
   pointcloud_fusion_batch_size: 5
