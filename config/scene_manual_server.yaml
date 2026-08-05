@@ -9,18 +9,18 @@ main:
   split: test
 
   # 服务器路径配置
-  package_path: /mnt/data/huangyixuan/isaac/HOV-SG-graph-dev-v2/hovsg
-  dataset_path: /mnt/data/huangyixuan/isaac/HOV-SG-graph-dev-v2/data
-  save_path: /mnt/data/huangyixuan/isaac/HOV-SG-graph-dev-v2/outputs/scene_manual
+  package_path: /mnt/data/huangyixuan/isaac/HOV-SG-graph-dev-multi-part/hovsg
+  dataset_path: /mnt/data/huangyixuan/isaac/robot_recordings
+  save_path: /mnt/data/huangyixuan/isaac/hovsg_outputs/planar_checks
 
 models:
   clip:
     type: ViT-H-14
-    checkpoint: /mnt/data/huangyixuan/isaac/HOV-SG-graph-dev-v2/checkpoints/laion2b_s32b_b79k.bin
+    checkpoint: /mnt/data/huangyixuan/checkpoints/hovsg/laion2b_s32b_b79k.bin
 
   sam:
     type: vit_h
-    checkpoint: /mnt/data/huangyixuan/isaac/HOV-SG-graph-dev-v2/checkpoints/sam_vit_h_4b8939.pth
+    checkpoint: /mnt/data/huangyixuan/checkpoints/hovsg/sam_vit_h_4b8939.pth
     points_per_side: 10
     pred_iou_thresh: 0.90
     points_per_batch: 144
@@ -41,6 +41,13 @@ pipeline:
   # 关键帧选择
   keyframe_translation_m: 0.05
   keyframe_rotation_deg: 5.0
+
+  # Flat-floor geometry test. Keep horizontal translation and yaw, but remove
+  # RTAB-Map roll, pitch, and camera-height drift before point-cloud fusion.
+  pose_mode: planar
+  planar_pose_height_m: 1.05
+  pose_warn_tilt_deg: 5.0
+  pose_warn_height_drift_m: 0.15
 
   # 位姿跳变检测
   max_pose_translation_jump_m: 0.5
