@@ -59,8 +59,16 @@ def project_camera_pose_to_planar_y_up(pose, height_m=None):
     return pose
 
 
-def project_world_transform_to_planar_y_up(transform, vertical_m=0.0):
-    """Project a Y-up world-to-world transform onto SE(2)."""
+def project_world_transform_to_gravity_aligned_y_up(
+    transform,
+    vertical_m=None,
+):
+    """Keep Y-up yaw and translation while removing roll and pitch.
+
+    ``vertical_m=None`` preserves vertical translation, which is required for
+    handheld capture parts that may start at different camera heights. Passing
+    a number fixes the vertical translation and produces an SE(2) transform.
+    """
     transform = as_pose_matrix(transform, name="transform").copy()
     forward = transform[:3, 2].copy()
     forward[1] = 0.0
@@ -76,8 +84,17 @@ def project_world_transform_to_planar_y_up(transform, vertical_m=0.0):
     forward /= np.linalg.norm(forward)
 
     transform[:3, :3] = np.column_stack((x_axis, up, forward))
-    transform[1, 3] = float(vertical_m)
+    if vertical_m is not None:
+        transform[1, 3] = float(vertical_m)
     return transform
+
+
+def project_world_transform_to_planar_y_up(transform, vertical_m=0.0):
+    """Project a Y-up world-to-world transform onto SE(2)."""
+    return project_world_transform_to_gravity_aligned_y_up(
+        transform,
+        vertical_m=vertical_m,
+    )
 
 
 def pose_delta(previous_pose, current_pose):
