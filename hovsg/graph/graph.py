@@ -84,6 +84,7 @@ class Graph:
         self.floors = []
         self.full_feats_array = []
         self.frame_indices = []
+        self.semantic_frame_indices = []
         self.graph = nx.Graph()
         self.graph.add_node(0, name="building", type="building")
         self.room_masks = {}
@@ -223,10 +224,29 @@ class Graph:
         return float(translation_m), float(rotation_deg)
 
     def _processing_frame_indices(self):
-        """Return accepted keyframes, or the configured stride as a fallback."""
+        """Return geometry keyframes, or the configured stride as a fallback."""
         if self.frame_indices:
             return self.frame_indices
-        return list(range(0, len(self.dataset), self.cfg.pipeline.skip_frames))
+        legacy_skip = int(self.cfg.pipeline.get("skip_frames", 1))
+        geometry_skip = max(
+            1,
+            int(self.cfg.pipeline.get("geometry_skip_frames", legacy_skip)),
+        )
+        return list(range(0, len(self.dataset), geometry_skip))
+
+    def _semantic_processing_frame_indices(self):
+        """Return the SAM/CLIP subset of accepted geometry keyframes."""
+        if self.semantic_frame_indices:
+            return self.semantic_frame_indices
+        geometry_indices = self._processing_frame_indices()
+        semantic_skip = max(
+            1,
+            int(self.cfg.pipeline.get("semantic_skip_frames", 1)),
+        )
+        selected = geometry_indices[::semantic_skip]
+        if geometry_indices and selected[-1] != geometry_indices[-1]:
+            selected.append(geometry_indices[-1])
+        return selected
 
     def create_feature_map(self, save_path=None):
         """
@@ -239,25 +259,49 @@ class Graph:
             print("No dataset loaded")
             return
 
+        legacy_skip_frames = int(self.cfg.pipeline.get("skip_frames", 1))
+        geometry_skip_frames = int(
+            self.cfg.pipeline.get(
+                "geometry_skip_frames",
+                legacy_skip_frames,
+            )
+        )
+        semantic_skip_frames = int(
+            self.cfg.pipeline.get("semantic_skip_frames", 1)
+        )
+        if geometry_skip_frames < 1:
+            raise ValueError("pipeline.geometry_skip_frames must be positive")
+        if semantic_skip_frames < 1:
+            raise ValueError("pipeline.semantic_skip_frames must be positive")
+
         candidate_frame_indices = list(
-            range(0, len(self.dataset), self.cfg.pipeline.skip_frames)
+            range(0, len(self.dataset), geometry_skip_frames)
         )
         if not candidate_frame_indices:
             raise RuntimeError("The dataset contains no frames to process")
 
         # ========== 新增: 进度估算 ==========
         estimated_time_per_frame = 4.0  # 秒/帧 (SAM+CLIP平均处理时间)
-        total_estimated_time = len(candidate_frame_indices) * estimated_time_per_frame
+        estimated_semantic_frames = max(
+            1,
+            int(np.ceil(len(candidate_frame_indices) / semantic_skip_frames)),
+        )
+        total_estimated_time = estimated_semantic_frames * estimated_time_per_frame
 
         print("=" * 70)
         print("📊 FEATURE MAP CREATION - PROGRESS ESTIMATION")
         print("=" * 70)
         print(f"  Total dataset frames: {len(self.dataset)}")
-        print(f"  Skip frames: {self.cfg.pipeline.skip_frames}")
-        print(f"  Candidate frames: {len(candidate_frame_indices)}")
+        print(f"  Geometry skip frames: {geometry_skip_frames}")
+        print(f"  Geometry candidate frames: {len(candidate_frame_indices)}")
+        print(f"  Semantic keyframe stride: {semantic_skip_frames}")
+        print(f"  Estimated semantic frames: {estimated_semantic_frames}")
         print(f"  Estimated time per frame: {estimated_time_per_frame:.1f}s")
         print(f"  ⏱️  Total estimated time: {total_estimated_time/60:.1f} minutes ({total_estimated_time/3600:.2f} hours)")
-        print(f"  💡 Tip: Increase skip_frames to reduce processing time")
+        print(
+            "  Tip: increase semantic_skip_frames to reduce SAM/CLIP time "
+            "without reducing geometry density"
+        )
         print("=" * 70)
         print()
 
@@ -306,7 +350,8 @@ class Graph:
             "START",
             dataset_frames=len(self.dataset),
             candidate_frames=len(candidate_frame_indices),
-            skip_frames=self.cfg.pipeline.skip_frames,
+            geometry_skip_frames=geometry_skip_frames,
+            semantic_skip_frames=semantic_skip_frames,
             voxel_size=voxel_size,
             keyframe_translation_m=keyframe_translation_m,
             keyframe_rotation_deg=keyframe_rotation_deg,
@@ -318,6 +363,7 @@ class Graph:
         # create the RGB-D point cloud
         self.full_pcd = o3d.geometry.PointCloud()
         self.frame_indices = []
+        self.semantic_frame_indices = []
         last_accepted_pose = None
         rejected_invalid_pose = 0
         rejected_pose_jump = 0
@@ -440,11 +486,16 @@ class Graph:
             raise RuntimeError(
                 "No frames passed pose validation and keyframe selection"
             )
+        self.semantic_frame_indices = self.frame_indices[::semantic_skip_frames]
+        if self.semantic_frame_indices[-1] != self.frame_indices[-1]:
+            self.semantic_frame_indices.append(self.frame_indices[-1])
         print_status(
             "FRAME_SELECTION",
             "OK",
             candidate_frames=len(candidate_frame_indices),
             accepted_keyframes=len(self.frame_indices),
+            semantic_keyframes=len(self.semantic_frame_indices),
+            semantic_skip_frames=semantic_skip_frames,
             rejected_invalid_pose=rejected_invalid_pose,
             rejected_pose_jump=rejected_pose_jump,
             rejected_non_keyframe=rejected_non_keyframe,
@@ -512,8 +563,10 @@ class Graph:
         association_attempts = 0
         association_accepted = 0
         for frame_position, i in enumerate(
-            tqdm(self.frame_indices, desc="Extracting features")
+            tqdm(self.semantic_frame_indices, desc="Extracting features")
         ):
+            # frame_position is the index of the frame in the selected frames
+            # i is the index of the frame in the dataset
             rgb_image, depth_image, pose, _, _ = self.dataset[i]
             if rgb_image.size != depth_image.size:
                 rgb_image = rgb_image.resize(depth_image.size)
@@ -535,6 +588,10 @@ class Graph:
                 )
                 continue
             F_2D, F_masks, masks, F_g = feature_result
+            # F_2D: pixel-level features, shape (H*W, D), feature for each pixel
+            # F_masks: mask-level features, shape (N_masks, D), feature for each mask(item)
+            # masks: list of masks, each mask is a binary mask of shape (H, W)
+            # F_g: global feature, shape (D,), feature for the whole image
             if F_2D is None or F_masks is None or masks is None:
                 print_status(
                     "SEMANTIC_FRAME",
@@ -555,7 +612,10 @@ class Graph:
                 filter_distance=self.cfg.pipeline.max_mask_distance,
                 association_distance=association_distance_m,
             )
+            # change 2D mask to 3D mask, each mask is a point cloud
+            # frames_pcd is a list of 3D masks for each frame, each mask is a point cloud
             frames_pcd.append(masks_3d)
+            # frame_feats is a list of features for each mask in the frame, each feature is a tensor of shape (D,)
             frames_feats.append(F_masks)
             # fuse features for each point in the full pcd
             if isinstance(self.dataset, RealRobotDataset):
@@ -605,7 +665,7 @@ class Graph:
 
             should_log = (
                 frame_position == 0
-                or frame_position == len(self.frame_indices) - 1
+                or frame_position == len(self.semantic_frame_indices) - 1
                 or (frame_position + 1) % log_every_n_frames == 0
             )
             if should_log:
@@ -614,7 +674,10 @@ class Graph:
                     "SEMANTIC_FRAME",
                     "OK",
                     frame_index=i,
-                    progress=f"{frame_position + 1}/{len(self.frame_indices)}",
+                    progress=(
+                        f"{frame_position + 1}/"
+                        f"{len(self.semantic_frame_indices)}"
+                    ),
                     sam_masks=len(masks),
                     mask_feature_shape=tuple(F_masks.shape),
                     pixel_feature_shape=tuple(F_2D.shape),
@@ -634,7 +697,7 @@ class Graph:
             "SEMANTIC_EXTRACTION",
             "OK",
             processed_frames=len(frames_pcd),
-            total_selected_frames=len(self.frame_indices),
+            total_selected_frames=len(self.semantic_frame_indices),
             association_attempts=association_attempts,
             association_accepted=association_accepted,
             association_ratio=(
@@ -682,9 +745,11 @@ class Graph:
 
         # remove any small pcds
         masks_before_size_filter = len(self.mask_pcds)
-        for i, pcd in enumerate(self.mask_pcds):
-            if pcd.is_empty() or len(pcd.points) < 100:
-                self.mask_pcds.pop(i)
+        self.mask_pcds = [
+            pcd
+            for pcd in self.mask_pcds
+            if not pcd.is_empty() and len(pcd.points) >= 100
+        ]
         print_status(
             "MASK_SIZE_FILTER",
             "OK",
@@ -1109,7 +1174,7 @@ class Graph:
         F_g_list = []
 
         all_global_clip_feats = dict()
-        processing_frame_indices = self._processing_frame_indices()
+        processing_frame_indices = self._semantic_processing_frame_indices()
         for i, img_id in tqdm(
             enumerate(processing_frame_indices),
             total=len(processing_frame_indices),
@@ -2015,15 +2080,25 @@ class Graph:
         """
         # # remove any small pcds
         tqdm.write("-- removing small and empty masks --")
-        for i, pcd in enumerate(self.mask_pcds):
-            if len(pcd.points) < 50:
-                self.mask_pcds.pop(i)
-                self.mask_feats.pop(i)
-
-        for i, pcd in enumerate(self.mask_pcds):
-            if pcd.is_empty():
-                self.mask_pcds.pop(i)
-                self.mask_feats.pop(i)
+        masks_before_save_filter = len(self.mask_pcds)
+        if len(self.mask_pcds) != len(self.mask_feats):
+            raise RuntimeError(
+                "mask point clouds and mask features must have equal length"
+            )
+        kept_mask_indices = [
+            index
+            for index, pcd in enumerate(self.mask_pcds)
+            if not pcd.is_empty() and len(pcd.points) >= 50
+        ]
+        self.mask_pcds = [self.mask_pcds[index] for index in kept_mask_indices]
+        self.mask_feats = [self.mask_feats[index] for index in kept_mask_indices]
+        print_status(
+            "MASK_SAVE_FILTER",
+            "OK",
+            masks_before=masks_before_save_filter,
+            masks_after=len(self.mask_pcds),
+            minimum_points=50,
+        )
 
         if state == "both":
             if not os.path.exists(path):

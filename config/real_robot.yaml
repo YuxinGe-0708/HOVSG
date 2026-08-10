@@ -41,7 +41,13 @@ pipeline:
   create_navigation: false
 
   voxel_size: 0.03
+  # Legacy fallback used by older configs and the geometry-only entry.
   skip_frames: 1
+  # Build geometry from dense frames, then run SAM/CLIP on every Nth accepted
+  # geometry keyframe. This keeps the map dense without paying semantic-model
+  # cost for every keyframe.
+  geometry_skip_frames: 1
+  semantic_skip_frames: 10
   # Keep a frame when either motion threshold is reached.
   keyframe_translation_m: 0.10
   keyframe_rotation_deg: 10.0
