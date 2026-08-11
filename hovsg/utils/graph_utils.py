@@ -520,7 +520,18 @@ def merge_3d_masks(mask_list, overlap_threshold=0.5, radius=0.02, iou_thresh=0.0
     :param iou_thresh (float): threshold for iou
     :return: merged point clouds and features
     """
-    
+    # SAM masks without valid depth or a nearby global-map association are
+    # represented by empty Open3D point clouds.  Remove them before creating
+    # bounding boxes or search indices; Open3D otherwise emits repeated
+    # "Failed due to no data" warnings during mask merging.
+    mask_list = [
+        pcd
+        for pcd in mask_list
+        if pcd is not None and not pcd.is_empty() and len(pcd.points) > 0
+    ]
+    if len(mask_list) <= 1:
+        return mask_list
+
     aa_bb = [pcd.get_axis_aligned_bounding_box() for pcd in mask_list]
     overlap_matrix = np.zeros((len(mask_list), len(mask_list)))
 

@@ -19,6 +19,9 @@ main:
   dataset_path: /mnt/data/real_camera/robot_recordings
 
   save_path: /mnt/data/real_camera/outputs/HOV-SG-graph-dev
+  # Optional exact directory containing full_pcd.ply, mask_feats.pt, and
+  # objects/. Used by application/build_graph_from_feature_map.py.
+  feature_map_path: null
 
 models:
   clip:
@@ -39,6 +42,8 @@ pipeline:
   extract_semantics: false
   create_graph: false
   create_navigation: false
+  # Resume graph/navigation from saved feature-map outputs without loading SAM.
+  skip_sam_initialization: false
 
   voxel_size: 0.03
   # Legacy fallback used by older configs and the geometry-only entry.
@@ -86,6 +91,15 @@ pipeline:
   save_intermediate_results: true
   obj_labels: HM3DSEM_LABELS
   merge_objects_graph: false
+
+  # Robust single-floor fallback. A detected height peak is preferred as the
+  # floor level; these quantiles only reject extreme vertical outliers and
+  # provide a fallback when the height histogram has no usable peaks.
+  force_single_floor: false
+  min_floor_height: 0.5
+  single_floor_lower_quantile: 0.02
+  single_floor_upper_quantile: 0.98
+  single_floor_lower_margin_m: 0.15
 
 robot:
   camera_height_m: 1.05

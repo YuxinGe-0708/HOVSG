@@ -137,29 +137,43 @@ class Graph:
             exists=os.path.isdir(self.graph_tmp_folder),
         )
 
-        # load the SAM model
-        model_type = self.cfg.models.sam.type
-        self.sam = sam_model_registry[model_type](
-            checkpoint=str(self.cfg.models.sam.checkpoint)
+        # Loading a saved feature map only needs CLIP for room/object labels;
+        # SAM is not used again.  Skipping it makes graph/navigation resume
+        # substantially faster and avoids several GB of unnecessary VRAM.
+        skip_sam_initialization = bool(
+            self.cfg.pipeline.get("skip_sam_initialization", False)
         )
-        self.sam.to(device=self.device)
-        self.mask_generator = SamAutomaticMaskGenerator(
-            model=self.sam,
-            points_per_side=self.cfg.models.sam.points_per_side,
-            pred_iou_thresh=self.cfg.models.sam.pred_iou_thresh,
-            points_per_batch=self.cfg.models.sam.points_per_batch,
-            stability_score_thresh=self.cfg.models.sam.stability_score_thresh,
-            crop_n_layers=self.cfg.models.sam.crop_n_layers,
-            min_mask_region_area=self.cfg.models.sam.min_mask_region_area,
-        )
-        self.sam.eval()
-        print_status(
-            "SAM_MODEL",
-            "OK",
-            model=model_type,
-            checkpoint=self.cfg.models.sam.checkpoint,
-            device=self.device,
-        )
+        self.sam = None
+        self.mask_generator = None
+        if skip_sam_initialization:
+            print_status(
+                "SAM_MODEL",
+                "SKIP",
+                reason="loading_saved_feature_map",
+            )
+        else:
+            model_type = self.cfg.models.sam.type
+            self.sam = sam_model_registry[model_type](
+                checkpoint=str(self.cfg.models.sam.checkpoint)
+            )
+            self.sam.to(device=self.device)
+            self.mask_generator = SamAutomaticMaskGenerator(
+                model=self.sam,
+                points_per_side=self.cfg.models.sam.points_per_side,
+                pred_iou_thresh=self.cfg.models.sam.pred_iou_thresh,
+                points_per_batch=self.cfg.models.sam.points_per_batch,
+                stability_score_thresh=self.cfg.models.sam.stability_score_thresh,
+                crop_n_layers=self.cfg.models.sam.crop_n_layers,
+                min_mask_region_area=self.cfg.models.sam.min_mask_region_area,
+            )
+            self.sam.eval()
+            print_status(
+                "SAM_MODEL",
+                "OK",
+                model=model_type,
+                checkpoint=self.cfg.models.sam.checkpoint,
+                device=self.device,
+            )
         # load the dataset
         dataset_cfg = {"root_dir": self.cfg.main.dataset_path, "transforms": None}
         if self.cfg.main.dataset == "hm3dsem":
@@ -612,11 +626,30 @@ class Graph:
                 filter_distance=self.cfg.pipeline.max_mask_distance,
                 association_distance=association_distance_m,
             )
+            masks_3d_before_filter = len(masks_3d)
+            valid_mask_indices = [
+                mask_index
+                for mask_index, mask_pcd in enumerate(masks_3d)
+                if not mask_pcd.is_empty() and len(mask_pcd.points) > 0
+            ]
+            masks_3d = [masks_3d[index] for index in valid_mask_indices]
             # change 2D mask to 3D mask, each mask is a point cloud
             # frames_pcd is a list of 3D masks for each frame, each mask is a point cloud
-            frames_pcd.append(masks_3d)
-            # frame_feats is a list of features for each mask in the frame, each feature is a tensor of shape (D,)
-            frames_feats.append(F_masks)
+            if masks_3d:
+                frames_pcd.append(masks_3d)
+                # Keep the mask features aligned with the retained 3D masks.
+                # frames_feats is currently diagnostic state, but preserving
+                # alignment avoids future regressions if it is reused.
+                frames_feats.append(F_masks[valid_mask_indices])
+            if masks_3d_before_filter != len(masks_3d):
+                print_status(
+                    "EMPTY_3D_MASK_FILTER",
+                    "OK",
+                    frame_index=i,
+                    masks_before=masks_3d_before_filter,
+                    masks_after=len(masks_3d),
+                    removed=masks_3d_before_filter - len(masks_3d),
+                )
             # fuse features for each point in the full pcd
             if isinstance(self.dataset, RealRobotDataset):
                 _, mask = self.dataset.get_valid_depth_mask(depth_image)
@@ -787,6 +820,94 @@ class Graph:
             mask_features=len(self.mask_feats),
         )
 
+    def _robust_single_floor_bounds(self, points, floor_peak=None):
+        """Estimate single-floor bounds while ignoring vertical outliers."""
+        heights = np.asarray(points, dtype=np.float64)[:, 1]
+        finite_heights = heights[np.isfinite(heights)]
+        if finite_heights.size == 0:
+            raise RuntimeError("Cannot estimate a floor from an empty point cloud")
+
+        lower_quantile = float(
+            self.cfg.pipeline.get("single_floor_lower_quantile", 0.02)
+        )
+        upper_quantile = float(
+            self.cfg.pipeline.get("single_floor_upper_quantile", 0.98)
+        )
+        if not 0.0 <= lower_quantile < upper_quantile <= 1.0:
+            raise ValueError(
+                "single-floor quantiles must satisfy "
+                "0 <= lower < upper <= 1"
+            )
+
+        robust_lower = float(np.quantile(finite_heights, lower_quantile))
+        robust_upper = float(np.quantile(finite_heights, upper_quantile))
+        minimum_height = max(
+            0.1,
+            float(self.cfg.pipeline.get("min_floor_height", 0.5)),
+        )
+
+        floor_zero_level = robust_lower
+        if floor_peak is not None and np.isfinite(floor_peak):
+            highest_valid_floor = robust_upper - minimum_height
+            if highest_valid_floor >= robust_lower:
+                floor_zero_level = float(
+                    np.clip(floor_peak, robust_lower, highest_valid_floor)
+                )
+
+        floor_upper_level = max(
+            robust_upper,
+            floor_zero_level + minimum_height,
+        )
+        return floor_zero_level, floor_upper_level
+
+    def _create_single_floor(
+        self,
+        floor_zero_level,
+        floor_upper_level,
+        reason,
+    ):
+        """Create a single Floor object from robust vertical bounds."""
+        points = np.asarray(self.full_pcd.points)
+        lower_margin = max(
+            0.0,
+            float(self.cfg.pipeline.get("single_floor_lower_margin_m", 0.15)),
+        )
+        min_bound = np.min(points, axis=0)
+        max_bound = np.max(points, axis=0)
+        min_bound[1] = floor_zero_level - lower_margin
+        max_bound[1] = floor_upper_level
+        floor_pcd = self.full_pcd.crop(
+            o3d.geometry.AxisAlignedBoundingBox(
+                min_bound=min_bound,
+                max_bound=max_bound,
+            )
+        )
+        if floor_pcd.is_empty():
+            raise RuntimeError(
+                "Single-floor fallback produced an empty point cloud: "
+                f"lower={floor_zero_level:.3f}, upper={floor_upper_level:.3f}"
+            )
+
+        floor = Floor("0", name="floor_0")
+        floor.pcd = floor_pcd
+        floor.floor_zero_level = float(floor_zero_level)
+        floor.floor_height = float(floor_upper_level - floor_zero_level)
+        floor.vertices = np.asarray(
+            floor_pcd.get_axis_aligned_bounding_box().get_box_points()
+        )
+        self.floors.append(floor)
+        print_status(
+            "FLOOR_DETECTION",
+            "OK",
+            mode="single_floor_fallback",
+            reason=reason,
+            floor_zero_level_m=floor.floor_zero_level,
+            floor_upper_level_m=float(floor_upper_level),
+            floor_height_m=floor.floor_height,
+            retained_points=len(floor.pcd.points),
+        )
+        return [floor]
+
     def segment_floors(self, path, flip_zy=False):
         """
         Segment the floors from the full point cloud
@@ -812,32 +933,22 @@ class Graph:
         force_single_floor = bool(self.cfg.pipeline.get("force_single_floor", False))
 
         if force_single_floor or y_range < min_floor_height:
-            print_status(
-                "FLOOR_DETECTION",
-                "OK",
-                mode="single_floor",
-                reason=f"Y-axis range ({y_range:.3f}m) < threshold ({min_floor_height:.3f}m)" if not force_single_floor else "force_single_floor=true",
+            floor_zero_level, floor_upper_level = self._robust_single_floor_bounds(
+                points
             )
-
-            # 创建单楼层
-            floor = Floor("0", name="floor_0")
-            floor.pcd = self.full_pcd
-            floor.floor_zero_level = y_min
-            floor.floor_height = y_range
-            floor.vertices = np.asarray(
-                self.full_pcd.get_axis_aligned_bounding_box().get_box_points()
+            reason = (
+                "force_single_floor=true"
+                if force_single_floor
+                else (
+                    f"Y-axis range ({y_range:.3f}m) < threshold "
+                    f"({min_floor_height:.3f}m)"
+                )
             )
-            self.floors.append(floor)
-
-            print_status(
-                "FLOOR_SEGMENTATION",
-                "OK",
-                floors=1,
-                floor_0_points=len(floor.pcd.points),
-                floor_0_height=f"{floor.floor_height:.3f}m",
+            return self._create_single_floor(
+                floor_zero_level,
+                floor_upper_level,
+                reason,
             )
-            return [floor]
-
         # ========== 原有多楼层分割逻辑 ==========
         print_status(
             "FLOOR_DETECTION",
@@ -888,8 +999,13 @@ class Graph:
 
         # cluster the peaks using DBSCAN
         peaks_locations = z_hist[1][peaks]
-        clustering = DBSCAN(eps=1, min_samples=1).fit(peaks_locations.reshape(-1, 1))
-        labels = clustering.labels_
+        if peaks_locations.size:
+            clustering = DBSCAN(eps=1, min_samples=1).fit(
+                peaks_locations.reshape(-1, 1)
+            )
+            labels = clustering.labels_
+        else:
+            labels = np.empty((0,), dtype=np.int32)
 
         # plot the histogram
         if self.cfg.pipeline.save_intermediate_results:
@@ -928,6 +1044,24 @@ class Graph:
         clustred_peaks = np.sort(clustred_peaks)
         print("clustred_peaks", clustred_peaks)
 
+        if len(clustred_peaks) < 2:
+            floor_peak = (
+                float(clustred_peaks[0]) if len(clustred_peaks) == 1 else None
+            )
+            floor_zero_level, floor_upper_level = self._robust_single_floor_bounds(
+                downpcd,
+                floor_peak=floor_peak,
+            )
+            return self._create_single_floor(
+                floor_zero_level,
+                floor_upper_level,
+                reason=(
+                    "only_one_height_peak"
+                    if floor_peak is not None
+                    else "no_height_peaks"
+                ),
+            )
+
         floors = []
         # for every two consecutive peaks with 2m distance, assign floor level
         for i in range(0, len(clustred_peaks) - 1, 2):
@@ -948,14 +1082,26 @@ class Graph:
                     max_bound=(np.inf, floor[1], np.inf),
                 )
             )
+            if floor_pcd.is_empty():
+                print_status(
+                    "FLOOR_SEGMENTATION",
+                    "WARN",
+                    floor_id=i,
+                    reason="empty_floor_interval",
+                    lower_bound_m=float(floor[0]),
+                    upper_bound_m=float(floor[1]),
+                )
+                continue
             bbox = floor_pcd.get_axis_aligned_bounding_box()
             floor_obj.vertices = np.asarray(bbox.get_box_points())
             floor_obj.pcd = floor_pcd
-            floor_obj.floor_zero_level = np.min(np.array(floor_pcd.points)[:, 1])
-            floor_obj.floor_height = floor[1] - floor_obj.floor_zero_level
+            floor_obj.floor_zero_level = float(floor[0])
+            floor_obj.floor_height = float(floor[1] - floor[0])
             self.floors.append(floor_obj)
             floors_pcd.append(floor_pcd)
-        return floors
+        if not floors_pcd:
+            raise RuntimeError("Floor detection produced no non-empty floor point clouds")
+        return self.floors
 
     def segment_rooms(self, floor: Floor, path):
         """
@@ -1523,13 +1669,20 @@ class Graph:
         )
 
         # create navigation graph for each floor
-        print_status("NAVIGATION_GRAPH", "START", floors=len(self.floors))
-        self.create_nav_graph()
-        print_status(
-            "NAVIGATION_GRAPH",
-            "OK",
-            path=os.path.join(self.cfg.main.save_path, "graph", "nav_graph"),
-        )
+        if bool(self.cfg.pipeline.get("create_navigation", True)):
+            print_status("NAVIGATION_GRAPH", "START", floors=len(self.floors))
+            self.create_nav_graph()
+            print_status(
+                "NAVIGATION_GRAPH",
+                "OK",
+                path=os.path.join(self.cfg.main.save_path, "graph", "nav_graph"),
+            )
+        else:
+            print_status(
+                "NAVIGATION_GRAPH",
+                "SKIP",
+                reason="pipeline.create_navigation=false",
+            )
 
         # save the graph
         self.save_graph(os.path.join(save_path, "graph"))
