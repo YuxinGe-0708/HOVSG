@@ -61,6 +61,46 @@ class NavigationGraphHandheldTest(unittest.TestCase):
         self.assertTrue(largest[5, 5])
         self.assertFalse(largest[16, 16])
 
+    def test_seeded_region_prefers_camera_supported_component(self):
+        binary_map = np.zeros((30, 30), dtype=np.uint8)
+        binary_map[1:20, 1:20] = 1
+        binary_map[22:27, 22:27] = 1
+        seed_map = np.zeros_like(binary_map)
+        seed_map[23:25, 23:25] = 1
+
+        selected = self.nav.get_seeded_free_region(binary_map, seed_map)
+
+        self.assertEqual(int(np.count_nonzero(selected)), 25)
+        self.assertTrue(selected[23, 23])
+        self.assertFalse(selected[5, 5])
+
+    def test_obstacle_grid_requires_density_support(self):
+        points = np.array(
+            [
+                [0.51, 0.51],
+                [0.52, 0.52],
+                [1.01, 1.01],
+                [1.02, 1.02],
+                [1.03, 1.03],
+            ]
+        )
+
+        grid = self.nav.create_occupancy_grid(
+            points,
+            dilation_radius=0,
+            filter_size=0,
+            min_points_per_cell=3,
+        )
+
+        sparse_cell = np.floor((np.array([0.51, 0.51]) - [0.0, 0.0]) / 0.1).astype(
+            int
+        )
+        dense_cell = np.floor((np.array([1.01, 1.01]) - [0.0, 0.0]) / 0.1).astype(
+            int
+        )
+        self.assertEqual(grid[sparse_cell[1], sparse_cell[0]], 0)
+        self.assertEqual(grid[dense_cell[1], dense_cell[0]], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

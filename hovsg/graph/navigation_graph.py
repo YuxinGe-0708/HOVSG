@@ -146,26 +146,36 @@ class NavigationGraph:
         self,
         floor_pcd: o3d.geometry.PointCloud,
         floor_info: Dict,
-        height_region: List[float] = [0.2, 1.5],
+        height_region: List[float] = None,
     ) -> np.ndarray:
         """Get the point cloud within a certain height range from the floor as the obstacles.
 
         Args:
             floor_pcd (o3d.geometry.PointCloud): The point cloud of the floor.
             floor_info (Dict): The floor information that contains the minimum height of the floor.
-            height_region (List[float], optional): The height range relative to the minimum of the floor in which the
-                point cloud is considered as obstacles. Defaults to [0.2, 1.5].
+            height_region (List[float], optional): Height range relative to the
+                estimated ground in which points are obstacles. Defaults to
+                [0.15, 1.8].
 
         Returns:
             floor_pcd (np.ndarray): The obstacle point cloud of the floor.
         """
+        if height_region is None:
+            height_region = [0.15, 1.8]
         floor_pcd = np.array(floor_pcd.points)
         floor_zero_level = floor_info["floor_zero_level"]
-        floor_height = floor_info["floor_height"]
-        # remove points above 2 meters from the floor
-        floor_pcd = floor_pcd[floor_pcd[:, 1] < floor_zero_level + height_region[1]]
-        # remove ground points (z < 0.1)
-        floor_pcd = floor_pcd[floor_pcd[:, 1] > floor_zero_level + height_region[0]]
+        ceiling_clearance = float(floor_info.get("ceiling_clearance_m", 0.20))
+        ceiling_height = floor_zero_level + float(floor_info["floor_height"])
+        obstacle_upper = min(
+            floor_zero_level + float(height_region[1]),
+            ceiling_height - ceiling_clearance,
+        )
+        # Exclude the fitted ground band and ceiling band explicitly. This
+        # prevents floor/ceiling duplicates from filling the obstacle grid.
+        floor_pcd = floor_pcd[floor_pcd[:, 1] < obstacle_upper]
+        floor_pcd = floor_pcd[
+            floor_pcd[:, 1] > floor_zero_level + float(height_region[0])
+        ]
         # project to 2D
         floor_pcd = floor_pcd[:, [0, 2]]
         # plot for debugging
@@ -177,27 +187,38 @@ class NavigationGraph:
         self,
         floor_pcd: o3d.geometry.PointCloud,
         floor_info: Dict,
-        height_max: float = 1.5,
+        ground_band: List[float] = None,
     ):
         """Get the point cloud within a certain height range from the floor.
 
         Args:
             floor_pcd (o3d.geometry.PointCloud): The point cloud of the floor.
             floor_info (Dict): The floor information that contains the minimum height of the floor.
-            height_max (float, optional): The maximum relative height considered as within the floor. Defaults to 1.5.
+            ground_band (List[float], optional): Lower and upper offsets around
+                the estimated ground used as floor evidence.
 
         Returns:
             floor_pcd (np.ndarray): The obstacle point cloud of the floor.
         """
+        if ground_band is None:
+            ground_band = [-0.08, 0.12]
         floor_pcd = np.array(floor_pcd.points)
+        floor_relative_height = floor_pcd[:, 1] - floor_info["floor_zero_level"]
         floor_pcd = floor_pcd[
-            floor_pcd[:, 1] < floor_info["floor_zero_level"] + height_max
+            np.logical_and(
+                floor_relative_height >= float(ground_band[0]),
+                floor_relative_height <= float(ground_band[1]),
+            )
         ]
         floor_pcd = floor_pcd[:, [0, 2]]
         return floor_pcd
 
     def create_occupancy_grid(
-        self, point_cloud: np.ndarray, dilation_radius: int = 5, filter_size: int = 3
+        self,
+        point_cloud: np.ndarray,
+        dilation_radius: int = 5,
+        filter_size: int = 3,
+        min_points_per_cell: int = 1,
     ) -> np.ndarray:
         """Create the occupancy grid map from the point cloud and apply dilation and smoothing.
 
@@ -211,7 +232,9 @@ class NavigationGraph:
             occupancy_grid_map (np.ndarray): The occupancy grid map.
         """
         # Initialize an empty grid map with all cells marked as unoccupied (0)
-        occupancy_grid_map = np.zeros(self.grid_size[::-1], dtype=int)
+        occupancy_grid_map = np.zeros(self.grid_size[::-1], dtype=np.uint8)
+        if point_cloud is None or len(point_cloud) == 0:
+            return occupancy_grid_map
 
         # handle point cloud with negative values
         point_cloud = point_cloud - self.pcd_min[[0, 2]]
@@ -219,20 +242,41 @@ class NavigationGraph:
         # Iterate through the point cloud and mark the corresponding cells as occupied (1)
         x_cells = np.floor(point_cloud[:, 0] / self.cell_size).astype(int)
         y_cells = np.floor(point_cloud[:, 1] / self.cell_size).astype(int)
-        # increment the cell value by 1
-        occupancy_grid_map[y_cells, x_cells] = 1
+        valid = np.logical_and.reduce(
+            (
+                x_cells >= 0,
+                x_cells < occupancy_grid_map.shape[1],
+                y_cells >= 0,
+                y_cells < occupancy_grid_map.shape[0],
+            )
+        )
+        counts = np.zeros_like(occupancy_grid_map, dtype=np.int32)
+        np.add.at(counts, (y_cells[valid], x_cells[valid]), 1)
+        occupancy_grid_map = (counts >= max(1, int(min_points_per_cell))).astype(
+            np.uint8
+        )
 
         if dilation_radius > 0:
+            kernel_size = max(1, int(dilation_radius))
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+            )
             occupancy_grid_map = cv2.dilate(
                 occupancy_grid_map.astype(np.uint8),
-                np.ones((dilation_radius, dilation_radius)),
+                kernel,
                 iterations=1,
             )
         # apply guassian filter to smooth the occupancy grid map
         if filter_size > 0:
-            occupancy_grid_map = cv2.GaussianBlur(
-                occupancy_grid_map.astype(np.float32), (filter_size, filter_size), 0
-            )
+            kernel_size = max(3, int(filter_size) | 1)
+            occupancy_grid_map = (
+                cv2.GaussianBlur(
+                    occupancy_grid_map.astype(np.float32),
+                    (kernel_size, kernel_size),
+                    0,
+                )
+                > 0.25
+            ).astype(np.uint8)
 
         return occupancy_grid_map
 
@@ -315,6 +359,38 @@ class NavigationGraph:
         foreground_areas = stats[1:, cv2.CC_STAT_AREA]
         largest_label = 1 + int(np.argmax(foreground_areas))
         return labels == largest_label
+
+    def get_seeded_free_region(
+        self, binary_map: np.ndarray, seed_map: np.ndarray = None
+    ) -> np.ndarray:
+        """Select the connected free region best supported by camera poses.
+
+        When poses are available, prefer the component containing the most
+        pose-region pixels. Area is used as a tie-breaker and as the fallback.
+        This prevents a large but unvisited isolated patch from replacing the
+        actually reachable room component.
+        """
+        input_map = (binary_map > 0).astype(np.uint8)
+        component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            input_map, 8, cv2.CV_32S
+        )
+        if component_count <= 1:
+            return np.zeros_like(input_map, dtype=bool)
+        seed_map = None if seed_map is None else np.asarray(seed_map) > 0
+        best_label = None
+        best_key = None
+        for label in range(1, component_count):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            seed_overlap = (
+                int(np.count_nonzero(np.logical_and(labels == label, seed_map)))
+                if seed_map is not None
+                else 0
+            )
+            key = (seed_overlap > 0, seed_overlap, area)
+            if best_key is None or key > best_key:
+                best_key = key
+                best_label = label
+        return labels == best_label
 
     def get_poses_region(
         self,
@@ -416,6 +492,13 @@ class NavigationGraph:
         save: bool = True,
         cluster_pose_heights: bool = False,
         pose_region_radius: float = 0.5,
+        obstacle_min_height_m: float = 0.15,
+        obstacle_max_height_m: float = 1.8,
+        ground_band_below_m: float = 0.08,
+        ground_band_above_m: float = 0.12,
+        ceiling_clearance_m: float = 0.20,
+        obstacle_min_points_per_cell: int = 3,
+        obstacle_inflation_radius_m: float = 0.38,
     ) -> np.ndarray:
         """Get the free region of the floor as a grid map.
 
@@ -429,9 +512,24 @@ class NavigationGraph:
         Returns:
             main_free_map (np.ndarray): The free region grid map. 1 is free, 0 is occupied.
         """
-        obstaces_vertices = self.obstacles_vertices(floor_pcd, floor_info)
-        floor_region_vertices = self.floor_region_vertices(floor_pcd, floor_info)
-        floor_occupancy_map = self.create_occupancy_grid(floor_region_vertices)
+        floor_info = dict(floor_info)
+        floor_info["ceiling_clearance_m"] = ceiling_clearance_m
+        obstaces_vertices = self.obstacles_vertices(
+            floor_pcd,
+            floor_info,
+            height_region=[obstacle_min_height_m, obstacle_max_height_m],
+        )
+        floor_region_vertices = self.floor_region_vertices(
+            floor_pcd,
+            floor_info,
+            ground_band=[-ground_band_below_m, ground_band_above_m],
+        )
+        floor_occupancy_map = self.create_occupancy_grid(
+            floor_region_vertices,
+            dilation_radius=1,
+            filter_size=0,
+            min_points_per_cell=1,
+        )
         if save:
             os.makedirs(floor_dir, exist_ok=True)
             cv2.imwrite(
@@ -447,13 +545,51 @@ class NavigationGraph:
             cluster=cluster_pose_heights,
         )
         np.logical_or(floor_occupancy_map, poses_map, out=floor_occupancy_map)
-        self.map = self.create_occupancy_grid(obstaces_vertices)
-        floor_free_map = floor_occupancy_map - self.map
+        inflation_diameter_cells = max(
+            1,
+            int(np.ceil(2.0 * obstacle_inflation_radius_m / self.cell_size)) + 1,
+        )
+        if inflation_diameter_cells % 2 == 0:
+            inflation_diameter_cells += 1
+        raw_obstacle_map = self.create_occupancy_grid(
+            obstaces_vertices,
+            dilation_radius=0,
+            filter_size=0,
+            min_points_per_cell=obstacle_min_points_per_cell,
+        )
+        self.map = self.create_occupancy_grid(
+            obstaces_vertices,
+            dilation_radius=inflation_diameter_cells,
+            filter_size=0,
+            min_points_per_cell=obstacle_min_points_per_cell,
+        )
+        floor_free_map = (
+            floor_occupancy_map.astype(np.int16) - self.map.astype(np.int16)
+        )
         floor_free_map = np.where(floor_free_map < 0, 0, floor_free_map).astype(
             np.uint8
         )
-        main_free_map = self.get_largest_region(floor_free_map)
+        main_free_map = self.get_seeded_free_region(floor_free_map, poses_map)
+        print_status(
+            "NAVIGATION_GRID",
+            "OK",
+            grid_width=int(self.grid_size[0]),
+            grid_height=int(self.grid_size[1]),
+            cell_size_m=float(self.cell_size),
+            ground_evidence_cells=int(np.count_nonzero(floor_occupancy_map)),
+            pose_region_cells=int(np.count_nonzero(poses_map)),
+            obstacle_cells=int(np.count_nonzero(self.map)),
+            raw_obstacle_cells=int(np.count_nonzero(raw_obstacle_map)),
+            free_cells=int(np.count_nonzero(floor_free_map)),
+            main_free_cells=int(np.count_nonzero(main_free_map)),
+            obstacle_min_points_per_cell=int(obstacle_min_points_per_cell),
+            obstacle_inflation_radius_m=float(obstacle_inflation_radius_m),
+        )
         if save:
+            cv2.imwrite(
+                os.path.join(floor_dir, "floor_obstacles_raw.png"),
+                raw_obstacle_map.astype(np.uint8) * 255,
+            )
             cv2.imwrite(
                 os.path.join(floor_dir, "floor_obstacles.png"),
                 self.map.astype(np.uint8) * 255,
@@ -1179,6 +1315,7 @@ class NavigationGraph:
         floor_dir: str,
         cluster_pose_heights: bool = False,
         pose_region_radius: float = 0.5,
+        navigation_config: Dict = None,
     ) -> nx.Graph:
         """Get the floor voronoi graph.
 
@@ -1195,6 +1332,7 @@ class NavigationGraph:
             "floor_zero_level": floor.floor_zero_level,
             "floor_height": floor.floor_height,
         }
+        navigation_config = navigation_config or {}
         main_free_map = self.get_main_free_map(
             floor.pcd,
             floor_info,
@@ -1202,7 +1340,42 @@ class NavigationGraph:
             floor_poses_list,
             cluster_pose_heights=cluster_pose_heights,
             pose_region_radius=pose_region_radius,
+            obstacle_min_height_m=float(
+                navigation_config.get("obstacle_min_height_m", 0.15)
+            ),
+            obstacle_max_height_m=float(
+                navigation_config.get("obstacle_max_height_m", 1.8)
+            ),
+            ground_band_below_m=float(
+                navigation_config.get("ground_band_below_m", 0.08)
+            ),
+            ground_band_above_m=float(
+                navigation_config.get("ground_band_above_m", 0.12)
+            ),
+            ceiling_clearance_m=float(
+                navigation_config.get("ceiling_clearance_m", 0.20)
+            ),
+            obstacle_min_points_per_cell=int(
+                navigation_config.get("obstacle_min_points_per_cell", 3)
+            ),
+            obstacle_inflation_radius_m=float(
+                navigation_config.get("obstacle_inflation_radius_m", 0.38)
+            ),
         ).astype(np.uint8)
+        minimum_navigable_area_m2 = float(
+            navigation_config.get("minimum_navigable_area_m2", 0.50)
+        )
+        navigable_area_m2 = float(
+            np.count_nonzero(main_free_map) * self.cell_size * self.cell_size
+        )
+        if navigable_area_m2 < minimum_navigable_area_m2:
+            raise RuntimeError(
+                "Reliable navigable area is too small after ground and obstacle "
+                f"filtering: {navigable_area_m2:.3f} m^2 < "
+                f"{minimum_navigable_area_m2:.3f} m^2. Check "
+                "ground_estimation.json, floor_obstacles_raw.png, and "
+                "floor_free_main.png before generating routes."
+            )
         top_down = self.get_top_down_rgb_map(floor.pcd, floor_info, floor_dir)
         voronoi_graph = self.get_voronoi_graph(
             main_free_map, top_down, floor_dir, int(floor.floor_id)

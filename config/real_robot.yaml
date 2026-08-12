@@ -95,11 +95,35 @@ pipeline:
   # Robust single-floor fallback. A detected height peak is preferred as the
   # floor level; these quantiles only reject extreme vertical outliers and
   # provide a fallback when the height histogram has no usable peaks.
-  force_single_floor: false
+  force_single_floor: true
   min_floor_height: 0.5
   single_floor_lower_quantile: 0.02
   single_floor_upper_quantile: 0.98
   single_floor_lower_margin_m: 0.15
+  # Single-floor ground estimation first finds peaks in the height histogram,
+  # then validates horizontal RANSAC planes using camera position, X-Z area
+  # and connected coverage. Quantiles are used only as a last fallback.
+  ground_estimation_voxel_m: 0.05
+  ground_normal_radius_m: 0.15
+  ground_normal_max_nn: 50
+  ground_normal_max_tilt_deg: 20.0
+  ground_histogram_bin_m: 0.02
+  ground_histogram_smoothing_sigma: 2.0
+  ground_peak_min_distance_m: 0.15
+  ground_peak_band_m: 0.10
+  ground_plane_distance_threshold_m: 0.04
+  ground_min_plane_inliers: 100
+  ground_coverage_cell_m: 0.10
+  ground_camera_height_min_m: 0.35
+  ground_camera_height_max_m: 2.20
+  ground_pose_proximity_m: 1.00
+  ground_min_camera_height_support_ratio: 0.50
+  ground_min_pose_proximity_ratio: 0.15
+  # Fail closed instead of silently treating a low outlier quantile as ground.
+  ground_allow_quantile_fallback: false
+  single_floor_min_room_height_m: 2.0
+  single_floor_max_room_height_m: 4.0
+  ceiling_min_camera_clearance_m: 0.30
 
 robot:
   # Used only for assigning poses in multi-floor mode. Single-floor handheld
@@ -112,5 +136,15 @@ navigation:
   cell_size_m: 0.05
   # Mark a 0.5 m neighborhood around every valid horizontal camera position.
   pose_region_radius_m: 0.50
+  # Only a narrow band around the fitted ground is used as floor evidence.
+  # Obstacles must have multiple supporting points in a cell and are inflated
+  # by the robot radius plus its safety margin.
+  ground_band_below_m: 0.08
+  ground_band_above_m: 0.12
+  obstacle_min_height_m: 0.15
+  obstacle_max_height_m: 1.80
+  ceiling_clearance_m: 0.20
+  obstacle_min_points_per_cell: 3
+  minimum_navigable_area_m2: 0.50
   # When floor detection returns one floor, navigation automatically ignores
   # camera height and disables stair inference for handheld recordings.

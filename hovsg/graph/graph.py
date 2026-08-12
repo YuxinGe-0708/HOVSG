@@ -3,12 +3,13 @@
 """
 
 import os
+import json
 import copy
 from typing import Any, Dict, List, Set, Tuple, Union
 from pathlib import Path
 
 import cv2
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 import numpy as np
 import open3d as o3d
 
@@ -56,6 +57,7 @@ from hovsg.graph.navigation_graph import NavigationGraph
 from hovsg.utils.label_feats import get_label_feats
 from hovsg.utils.constants import MATTERPORT_GT_LABELS, CLIP_DIM
 from hovsg.utils.runtime_status import print_status
+from hovsg.utils.floor_estimation import estimate_single_floor_geometry
 from hovsg.utils.llm_utils import (
     parse_floor_room_object_gpt35,
     parse_hier_query,
@@ -860,6 +862,107 @@ class Graph:
         )
         return floor_zero_level, floor_upper_level
 
+    def _valid_camera_positions(self):
+        """Return finite camera positions for geometric floor constraints."""
+        positions = []
+        for index in self._processing_frame_indices():
+            try:
+                if hasattr(self.dataset, "load_pose") and hasattr(
+                    self.dataset, "data_list"
+                ):
+                    pose = self.dataset.load_pose(self.dataset.data_list[index][2])
+                else:
+                    _, _, pose, _, _ = self.dataset[index]
+            except (IndexError, OSError, ValueError):
+                continue
+            pose = np.asarray(pose, dtype=np.float64)
+            pose_valid, _ = self._validate_pose(pose)
+            if pose_valid:
+                positions.append(pose[:3, 3].copy())
+        return positions
+
+    def _estimate_single_floor_geometry(self, reason):
+        """Estimate a real floor using constrained horizontal plane peaks."""
+        result = estimate_single_floor_geometry(
+            self.full_pcd,
+            self._valid_camera_positions(),
+            self.cfg.pipeline,
+        )
+        floor_zero_level = float(result["floor_zero_level"])
+        floor_upper_level = float(result["floor_upper_level"])
+        ground = result["ground"]
+        print_status(
+            "GROUND_ESTIMATION",
+            "OK" if not result["fallback_used"] else "WARN",
+            method=(
+                "height_peaks_horizontal_planes"
+                if not result["fallback_used"]
+                else "height_quantile_fallback"
+            ),
+            reason=reason,
+            candidates=result["candidate_count"],
+            floor_zero_level_m=floor_zero_level,
+            floor_upper_level_m=floor_upper_level,
+            ground_score=float(ground["score"]),
+            ground_inliers=int(ground["inliers"]),
+            ground_coverage_area_m2=float(ground["coverage_area_m2"]),
+            ground_connected_fraction=float(ground["connected_fraction"]),
+            ground_camera_height_support=float(ground["camera_height_support"]),
+            ground_camera_proximity_support=float(
+                ground["camera_proximity_support"]
+            ),
+            ground_verticality=float(ground["verticality"]),
+            ground_plane_residual_median_m=float(
+                ground.get("plane_residual_median_m", 0.0)
+            ),
+            ceiling_source=result["ceiling_source"],
+        )
+        if self.cfg.pipeline.save_intermediate_results:
+            os.makedirs(self.graph_tmp_folder, exist_ok=True)
+            diagnostic = {
+                "floor_zero_level_m": floor_zero_level,
+                "floor_upper_level_m": floor_upper_level,
+                "fallback_used": bool(result["fallback_used"]),
+                "fallback_allowed": bool(result["fallback_allowed"]),
+                "ceiling_source": result["ceiling_source"],
+                "ground": result["ground"],
+                "ceiling": result["ceiling"],
+                "candidates": result["candidates"],
+            }
+            with open(
+                os.path.join(self.graph_tmp_folder, "ground_estimation.json"),
+                "w",
+                encoding="utf-8",
+            ) as file:
+                json.dump(diagnostic, file, indent=2)
+            plt.figure(figsize=(10, 4))
+            plt.plot(
+                result["histogram_centers"],
+                result["histogram_counts"],
+                label="horizontal-point height density",
+            )
+            for candidate in result["candidates"]:
+                plt.axvline(candidate["height"], color="orange", alpha=0.35)
+            plt.axvline(floor_zero_level, color="green", label="selected ground")
+            plt.axvline(floor_upper_level, color="blue", label="ceiling/upper bound")
+            plt.xlabel("Y height (m)")
+            plt.ylabel("smoothed point count")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(
+                os.path.join(self.graph_tmp_folder, "ground_estimation.png")
+            )
+            plt.close()
+        if result["fallback_used"] and not result["fallback_allowed"]:
+            raise RuntimeError(
+                "No reliable ground plane satisfied the horizontal, camera-height, "
+                "trajectory-proximity, and X-Z coverage constraints. Diagnostics "
+                "were saved to tmp/ground_estimation.json and "
+                "tmp/ground_estimation.png; refusing to build navigation from an "
+                "unverified height quantile."
+            )
+        return floor_zero_level, floor_upper_level
+
     def _create_single_floor(
         self,
         floor_zero_level,
@@ -933,9 +1036,6 @@ class Graph:
         force_single_floor = bool(self.cfg.pipeline.get("force_single_floor", False))
 
         if force_single_floor or y_range < min_floor_height:
-            floor_zero_level, floor_upper_level = self._robust_single_floor_bounds(
-                points
-            )
             reason = (
                 "force_single_floor=true"
                 if force_single_floor
@@ -943,6 +1043,9 @@ class Graph:
                     f"Y-axis range ({y_range:.3f}m) < threshold "
                     f"({min_floor_height:.3f}m)"
                 )
+            )
+            floor_zero_level, floor_upper_level = (
+                self._estimate_single_floor_geometry(reason)
             )
             return self._create_single_floor(
                 floor_zero_level,
@@ -1048,9 +1151,12 @@ class Graph:
             floor_peak = (
                 float(clustred_peaks[0]) if len(clustred_peaks) == 1 else None
             )
-            floor_zero_level, floor_upper_level = self._robust_single_floor_bounds(
-                downpcd,
-                floor_peak=floor_peak,
+            floor_zero_level, floor_upper_level = (
+                self._estimate_single_floor_geometry(
+                    "only_one_height_peak"
+                    if floor_peak is not None
+                    else "no_height_peaks"
+                )
             )
             return self._create_single_floor(
                 floor_zero_level,
@@ -1828,6 +1934,16 @@ class Graph:
                 nav_dir,
                 cluster_pose_heights=False,
                 pose_region_radius=pose_region_radius_m,
+                navigation_config={
+                    **dict(OmegaConf.to_container(navigation_cfg, resolve=True)),
+                    "obstacle_inflation_radius_m": float(
+                        navigation_cfg.get(
+                            "obstacle_inflation_radius_m",
+                            float(robot_cfg.get("radius_m", 0.28))
+                            + float(robot_cfg.get("safety_margin_m", 0.10)),
+                        )
+                    ),
+                },
             )
             if (
                 sparse_stairs_voronoi is not None
