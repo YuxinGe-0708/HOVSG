@@ -183,8 +183,8 @@ def align_parts(
     voxel_size=0.05,
     overlap_frames=120,
     skip_frames=3,
-    pose_mode="planar",
-    registration_dof="planar",
+    pose_mode="raw",
+    registration_dof="gravity_aligned",
     min_fitness=0.30,
     max_rmse=0.10,
     manual_initials=None,
@@ -315,11 +315,16 @@ def main():
     parser.add_argument("--voxel-size", type=float, default=0.05)
     parser.add_argument("--overlap-frames", type=int, default=120)
     parser.add_argument("--skip-frames", type=int, default=3)
-    parser.add_argument("--pose-mode", choices=("raw", "planar"), default="planar")
+    parser.add_argument(
+        "--pose-mode",
+        choices=("raw", "planar"),
+        default="raw",
+        help="Handheld RGB-D+IMU capture must use raw.",
+    )
     parser.add_argument(
         "--registration-dof",
         choices=("planar", "gravity_aligned", "full"),
-        default="planar",
+        default="gravity_aligned",
     )
     parser.add_argument("--min-fitness", type=float, default=0.30)
     parser.add_argument("--max-rmse", type=float, default=0.10)

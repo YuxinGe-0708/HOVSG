@@ -79,7 +79,7 @@ def main():
     ]
     validate_camera_compatibility(parts)
     output_root = ensure_new_directory(args.output_dir)
-    pose_mode = registration.get("pose_mode", "planar")
+    pose_mode = registration.get("pose_mode", "raw")
 
     for part in parts:
         part_output = output_root / part.name

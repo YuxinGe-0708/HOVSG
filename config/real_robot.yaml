@@ -59,9 +59,9 @@ pipeline:
   # Reject discontinuous localization poses instead of corrupting the map.
   max_pose_translation_jump_m: 0.75
   max_pose_rotation_jump_deg: 45.0
-  # Flat-floor robots should use planar mode. It preserves X/Z and yaw while
-  # fixing camera height and removing visual-odometry roll/pitch drift.
-  pose_mode: planar # raw, planar
+  # Handheld RGB-D geometry must preserve real camera pitch, roll, and height.
+  # Navigation separately ignores pose height for this single-floor capture.
+  pose_mode: raw # raw, planar
   planar_pose_height_m: null # null uses the first valid camera pose height
   pose_warn_tilt_deg: 5.0
   pose_warn_height_drift_m: 0.15
@@ -102,9 +102,15 @@ pipeline:
   single_floor_lower_margin_m: 0.15
 
 robot:
+  # Used only for assigning poses in multi-floor mode. Single-floor handheld
+  # navigation intentionally ignores pose height.
   camera_height_m: 1.05
   radius_m: 0.28
   safety_margin_m: 0.10
 
 navigation:
   cell_size_m: 0.05
+  # Mark a 0.5 m neighborhood around every valid horizontal camera position.
+  pose_region_radius_m: 0.50
+  # When floor detection returns one floor, navigation automatically ignores
+  # camera height and disables stair inference for handheld recordings.

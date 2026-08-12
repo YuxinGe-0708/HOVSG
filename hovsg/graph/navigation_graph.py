@@ -28,6 +28,7 @@ from hovsg.graph.floor import Floor
 from hovsg.graph.object import Object
 from hovsg.utils.constants import MATTERPORT_LABELS_40
 from hovsg.utils.clip_utils import get_text_feats_62_templates
+from hovsg.utils.runtime_status import print_status
 
 # change matplotlib backend to a gui one
 plt.switch_backend("Agg")
@@ -72,6 +73,7 @@ class NavigationGraph:
         poses_list: List[np.ndarray],
         upper_floor_min_height: float = None,
         camera_height: float = 1.5,
+        filter_by_height: bool = True,
     ) -> List[np.ndarray]:
         """Return the list of poses that are within the height range of the floor.
 
@@ -80,12 +82,23 @@ class NavigationGraph:
             poses_list (List[np.ndarray]): The list of camera poses for the exploration of the whole scene (multi-floor).
             upper_floor_min_height (float, optional): The uppebound of the height range that is used to determined the poses
                 belonging to the floor. If None, then use the upper bound of the floor point cloud. Defaults to None.
-            camera_height (float, optional): The height of the camera. Defaults to 1.5.
+            camera_height (float, optional): Camera height used only for multi-floor assignment.
+            filter_by_height (bool, optional): Whether to assign poses by camera height. Single-floor
+                handheld recordings should disable this so vertical hand motion and SLAM drift do not
+                discard the horizontal trajectory.
 
         Returns:
             floor_poses_list (List[np.ndarray]): A list of (4, 4) numpy arrays representing the poses that are within the
                 height range of the floor.
         """
+        valid_poses = [
+            np.asarray(pose, dtype=np.float64)
+            for pose in poses_list
+            if np.asarray(pose).shape == (4, 4) and np.isfinite(pose).all()
+        ]
+        if not filter_by_height:
+            return valid_poses
+
         floor_min_height = np.min(np.asarray(floor.pcd.points)[:, 1])
         floor_max_height = np.max(np.asarray(floor.pcd.points)[:, 1])
         floor_poses_list = []
@@ -94,8 +107,7 @@ class NavigationGraph:
             if upper_floor_min_height is not None
             else floor_max_height
         )
-        for pose in poses_list:
-
+        for pose in valid_poses:
             if (
                 pose[1, 3] - camera_height >= floor_min_height
                 and pose[1, 3] - camera_height < upperbound
@@ -291,13 +303,18 @@ class NavigationGraph:
         """
         # Threshold it so it becomes binary
         # ret, thresh = cv2.threshold(binary_map, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        input = (binary_map > 0).astype(np.uint8)
-        output = cv2.connectedComponentsWithStats(input, 8, cv2.CV_8UC1)
-        areas = output[2][:, -1]
-        # TODO: the top region is 0 region, so we need to sort the areas and get the second largest
-        # but I am not sure if the largest region is always the background
-        id = np.argsort(areas)[::-1][1]
-        return output[1] == id
+        input_map = (binary_map > 0).astype(np.uint8)
+        component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            input_map, 8, cv2.CV_32S
+        )
+        if component_count <= 1:
+            return np.zeros_like(input_map, dtype=bool)
+
+        # Label 0 is always the background. Select only among foreground labels;
+        # sorting all areas fails whenever foreground happens to be larger than it.
+        foreground_areas = stats[1:, cv2.CC_STAT_AREA]
+        largest_label = 1 + int(np.argmax(foreground_areas))
+        return labels == largest_label
 
     def get_poses_region(
         self,
@@ -305,7 +322,9 @@ class NavigationGraph:
         floor_dir: str = None,
         radius: float = 0.5,
         save: bool = True,
-        cluster: bool = True,
+        cluster: bool = False,
+        height_cluster_eps_m: float = 0.1,
+        height_tolerance_m: float = 0.1,
     ) -> np.ndarray:
         """Get the region grid map where the pose positions and their circular surrounding are. Each location is marked with a circle with a certain radius.
 
@@ -315,33 +334,74 @@ class NavigationGraph:
             radius (float, optional): The radius of the circle around the pose location. Defaults to 0.5.
             save (bool, optional): The boolean controlling whether to store the pose region grid map as a file.
                 Defaults to True.
-            cluster (bool, optional): The boolean controlling whether to cluster the poses' height. Defaults to True.
+            cluster (bool, optional): Whether to keep only the dominant camera-height cluster. This is
+                intended only for legacy multi-floor data and must remain disabled for handheld data.
+            height_cluster_eps_m (float, optional): DBSCAN epsilon for legacy height clustering.
+            height_tolerance_m (float, optional): Height tolerance around the dominant cluster mean.
 
         Returns:
             pose_map (np.ndarray): The resulting pose region grid map. 1 is the pose region, 0 is the non-pose region.
         """
-        pose_heights = np.array([pose[1, 3] for pose in poses_list])
-        clusters = DBSCAN(eps=0.1).fit(pose_heights.reshape(-1, 1))
-        labels, counts = np.unique(clusters.labels_, return_counts=True)
-        id = np.argmax(counts)
-        mask = clusters.labels_ == labels[id]
-        major_height = np.mean(pose_heights[mask])
-        if cluster:
-            poses_list = [
-                pose for pose in poses_list if np.abs(pose[1, 3] - major_height) < 0.1
+        poses_map = np.zeros(self.grid_size[::-1], dtype=np.uint8)
+        input_pose_count = len(poses_list) if poses_list is not None else 0
+        pose_source = [] if poses_list is None else poses_list
+        valid_poses = [
+            np.asarray(pose, dtype=np.float64)
+            for pose in pose_source
+            if np.asarray(pose).shape == (4, 4) and np.isfinite(pose).all()
+        ]
+        finite_pose_count = len(valid_poses)
+
+        if cluster and valid_poses:
+            pose_heights = np.array([pose[1, 3] for pose in valid_poses])
+            clusters = DBSCAN(
+                eps=max(float(height_cluster_eps_m), 1e-6), min_samples=1
+            ).fit(pose_heights.reshape(-1, 1))
+            labels, counts = np.unique(clusters.labels_, return_counts=True)
+            dominant_label = labels[int(np.argmax(counts))]
+            dominant_mask = clusters.labels_ == dominant_label
+            dominant_height = float(np.mean(pose_heights[dominant_mask]))
+            valid_poses = [
+                pose
+                for pose in valid_poses
+                if abs(float(pose[1, 3]) - dominant_height)
+                <= float(height_tolerance_m)
             ]
 
-            poses_min = np.min(np.array(poses_list)[:, 1, 3])
-            poses_list = [pose for pose in poses_list if pose[1, 3] < poses_min + 0.1]
+        if valid_poses:
+            horizontal_positions = np.array(
+                [pose[[0, 2], 3] for pose in valid_poses], dtype=np.float64
+            )
+            grid_positions = np.rint(
+                (horizontal_positions - self.pcd_min[[0, 2]]) / self.cell_size
+            ).astype(np.int32)
+        else:
+            grid_positions = np.empty((0, 2), dtype=np.int32)
 
-        poses_list = np.array(poses_list)
-        poses_list = poses_list[:, [0, 2], 3]
-        poses_list = (poses_list - self.pcd_min[[0, 2]]) / self.cell_size
-        poses_list = np.int32(poses_list)
-        poses_map = np.zeros(self.grid_size[::-1], dtype=np.uint8)
-        for pose in poses_list:
-            cv2.circle(poses_map, tuple(pose), int(radius / self.cell_size), 1, -1)
+        height, width = poses_map.shape
+        in_bounds = (
+            (grid_positions[:, 0] >= 0)
+            & (grid_positions[:, 0] < width)
+            & (grid_positions[:, 1] >= 0)
+            & (grid_positions[:, 1] < height)
+        )
+        rasterized_positions = grid_positions[in_bounds]
+        radius_cells = max(1, int(np.ceil(float(radius) / self.cell_size)))
+        for pose in rasterized_positions:
+            cv2.circle(poses_map, tuple(pose), radius_cells, 1, -1)
+
+        print_status(
+            "POSE_REGION",
+            "OK",
+            input_poses=input_pose_count,
+            finite_poses=finite_pose_count,
+            height_clustering=cluster,
+            selected_poses=len(grid_positions),
+            rasterized_poses=len(rasterized_positions),
+            radius_m=float(radius),
+        )
         if save:
+            os.makedirs(floor_dir, exist_ok=True)
             cv2.imwrite(
                 os.path.join(floor_dir, f"poses_region_map.png"), poses_map * 255
             )
@@ -354,6 +414,8 @@ class NavigationGraph:
         floor_dir: str = None,
         floor_poses_list: List[np.ndarray] = None,
         save: bool = True,
+        cluster_pose_heights: bool = False,
+        pose_region_radius: float = 0.5,
     ) -> np.ndarray:
         """Get the free region of the floor as a grid map.
 
@@ -378,7 +440,11 @@ class NavigationGraph:
             )
         # floor_occupancy_map = binary_closing(floor_occupancy_map, iterations=5)
         poses_map = self.get_poses_region(
-            floor_poses_list, floor_dir=floor_dir, radius=0.5, save=save
+            floor_poses_list,
+            floor_dir=floor_dir,
+            radius=pose_region_radius,
+            save=save,
+            cluster=cluster_pose_heights,
         )
         np.logical_or(floor_occupancy_map, poses_map, out=floor_occupancy_map)
         self.map = self.create_occupancy_grid(obstaces_vertices)
@@ -777,6 +843,10 @@ class NavigationGraph:
         Returns:
             spares_voronoi_graph (nx.Graph): The stairs graph.
         """
+        if poses_list is None or len(poses_list) < 2:
+            self.has_stairs = False
+            return nx.Graph()
+
         floor_pcd = floor.pcd
         floor_info = {
             "floor_zero_level": floor.floor_zero_level,
@@ -820,6 +890,9 @@ class NavigationGraph:
             if h > height_max:
                 ed_id = hi
                 break
+        if st_id is None or ed_id is None or ed_id <= st_id:
+            self.has_stairs = False
+            return nx.Graph()
         for hi in range(st_id, ed_id):
             if pose_heights[hi] < height_min:
                 st_id = hi
@@ -1100,7 +1173,12 @@ class NavigationGraph:
         return sparse_stairs_voronoi
 
     def get_floor_graph(
-        self, floor: Floor, floor_poses_list: List[np.ndarray], floor_dir: str
+        self,
+        floor: Floor,
+        floor_poses_list: List[np.ndarray],
+        floor_dir: str,
+        cluster_pose_heights: bool = False,
+        pose_region_radius: float = 0.5,
     ) -> nx.Graph:
         """Get the floor voronoi graph.
 
@@ -1118,7 +1196,12 @@ class NavigationGraph:
             "floor_height": floor.floor_height,
         }
         main_free_map = self.get_main_free_map(
-            floor.pcd, floor_info, floor_dir, floor_poses_list
+            floor.pcd,
+            floor_info,
+            floor_dir,
+            floor_poses_list,
+            cluster_pose_heights=cluster_pose_heights,
+            pose_region_radius=pose_region_radius,
         ).astype(np.uint8)
         top_down = self.get_top_down_rgb_map(floor.pcd, floor_info, floor_dir)
         voronoi_graph = self.get_voronoi_graph(
@@ -1152,12 +1235,22 @@ class NavigationGraph:
         Returns:
             tar_graph (nx.Graph): The resulting graph.
         """
+        if src_graph.number_of_nodes() == 0:
+            return tar_graph
+        if tar_graph.number_of_nodes() == 0:
+            return src_graph
+
         # find closest node from src_graph to tar_graph
         floor_nodes = [
             (i, tar_graph.nodes[node]["pos"])
             for i, node in enumerate(tar_graph.nodes)
             if tar_graph.degree(node) > 1
         ]
+        if not floor_nodes:
+            floor_nodes = [
+                (i, tar_graph.nodes[node]["pos"])
+                for i, node in enumerate(tar_graph.nodes)
+            ]
         floor_node_ids = [node[0] for node in floor_nodes]
         floor_nodes = np.array([node[1] for node in floor_nodes])
         stairs_nodes = np.array(
@@ -1195,6 +1288,9 @@ class NavigationGraph:
             tar_pos = np.int32([floor_node[1], floor_node[0]])
             cv2.circle(fig, tuple(src_pos), 3, (0, 255, 0), -1)
             cv2.circle(fig, tuple(tar_pos), 3, (0, 255, 0), -1)
+            cv2.imwrite(
+                os.path.join(floor_dir, "vor_rgb_combined_highlighted.png"), fig
+            )
         return tar_graph
 
     def connect_stairs_and_floor_graphs(

@@ -1713,9 +1713,87 @@ class Graph:
 
         # get pose list
         poses_list = []
+        rejected_invalid_poses = 0
+        rejected_pose_jumps = 0
+        previous_pose = None
+        max_translation_jump_m = float(
+            self.cfg.pipeline.get("max_pose_translation_jump_m", float("inf"))
+        )
+        max_rotation_jump_deg = float(
+            self.cfg.pipeline.get("max_pose_rotation_jump_deg", float("inf"))
+        )
         for i in self._processing_frame_indices():
             _, _, pose, _, _ = self.dataset[i]
+            pose = np.asarray(pose, dtype=np.float64)
+            pose_valid, _ = self._validate_pose(pose)
+            if not pose_valid:
+                rejected_invalid_poses += 1
+                continue
+            if previous_pose is not None:
+                translation_m, rotation_deg = self._pose_delta(previous_pose, pose)
+                if (
+                    translation_m > max_translation_jump_m
+                    or rotation_deg > max_rotation_jump_deg
+                ):
+                    rejected_pose_jumps += 1
+                    previous_pose = pose
+                    continue
             poses_list.append(pose)
+            previous_pose = pose
+
+        if not poses_list:
+            raise RuntimeError("No valid camera poses are available for navigation")
+
+        print_status(
+            "NAVIGATION_POSES",
+            "OK",
+            accepted=len(poses_list),
+            rejected_invalid=rejected_invalid_poses,
+            rejected_jump=rejected_pose_jumps,
+            max_translation_jump_m=max_translation_jump_m,
+            max_rotation_jump_deg=max_rotation_jump_deg,
+        )
+
+        if not self.floors:
+            raise RuntimeError("Cannot create a navigation graph without floors")
+
+        navigation_cfg = self.cfg.get("navigation", {})
+        robot_cfg = self.cfg.get("robot", {})
+        cell_size_m = float(navigation_cfg.get("cell_size_m", 0.03))
+        pose_region_radius_m = float(
+            navigation_cfg.get("pose_region_radius_m", 0.5)
+        )
+        camera_height_m = float(robot_cfg.get("camera_height_m", 1.5))
+        if cell_size_m <= 0.0:
+            raise ValueError("navigation.cell_size_m must be positive")
+        if pose_region_radius_m <= 0.0:
+            raise ValueError("navigation.pose_region_radius_m must be positive")
+        if camera_height_m <= 0.0:
+            raise ValueError("robot.camera_height_m must be positive")
+        single_floor_mode = bool(
+            self.cfg.pipeline.get("force_single_floor", False)
+        ) or len(self.floors) == 1
+        filter_pose_heights = bool(
+            navigation_cfg.get("filter_pose_heights", not single_floor_mode)
+        )
+        infer_stairs = bool(
+            navigation_cfg.get("infer_stairs", not single_floor_mode)
+        )
+        if single_floor_mode:
+            filter_pose_heights = False
+            infer_stairs = False
+
+        print_status(
+            "NAVIGATION_MODE",
+            "OK",
+            single_floor=single_floor_mode,
+            filter_pose_heights=filter_pose_heights,
+            infer_stairs=infer_stairs,
+            camera_height_m=camera_height_m,
+            pose_region_radius_m=pose_region_radius_m,
+            cell_size_m=cell_size_m,
+            input_poses=len(poses_list),
+        )
 
         for floor_id, floor in enumerate(self.floors):
             print_status(
@@ -1725,19 +1803,36 @@ class Graph:
                 floor_points=len(floor.pcd.points),
                 poses=len(poses_list),
             )
-            nav_graph = NavigationGraph(floor.pcd, cell_size=0.03)
+            nav_graph = NavigationGraph(floor.pcd, cell_size=cell_size_m)
             upperbound = None
             if floor_id + 1 < len(self.floors):
                 upperbound = self.floors[floor_id + 1].floor_zero_level
-            floor_poses_list = nav_graph.get_floor_poses(floor, poses_list, upperbound)
+            floor_poses_list = nav_graph.get_floor_poses(
+                floor,
+                poses_list,
+                upperbound,
+                camera_height=camera_height_m,
+                filter_by_height=filter_pose_heights,
+            )
 
-            sparse_stairs_voronoi = nav_graph.get_stairs_graph_with_poses_v2(
-                floor, floor_id, poses_list, nav_dir
-            )
+            sparse_stairs_voronoi = None
+            if infer_stairs:
+                stairs_candidate = nav_graph.get_stairs_graph_with_poses_v2(
+                    floor, floor_id, poses_list, nav_dir
+                )
+                if stairs_candidate.number_of_nodes() > 0:
+                    sparse_stairs_voronoi = stairs_candidate
             sparse_floor_voronoi = nav_graph.get_floor_graph(
-                floor, floor_poses_list, nav_dir
+                floor,
+                floor_poses_list,
+                nav_dir,
+                cluster_pose_heights=False,
+                pose_region_radius=pose_region_radius_m,
             )
-            if sparse_stairs_voronoi is not None:
+            if (
+                sparse_stairs_voronoi is not None
+                and sparse_stairs_voronoi.number_of_nodes() > 0
+            ):
                 print(f"connecting stairs and floor {floor_id}")
                 sparse_floor_voronoi = nav_graph.connect_stairs_and_floor_graphs(
                     sparse_stairs_voronoi, sparse_floor_voronoi, nav_dir
@@ -1752,7 +1847,10 @@ class Graph:
                 floor_poses=len(floor_poses_list),
                 nodes=sparse_floor_voronoi.number_of_nodes(),
                 edges=sparse_floor_voronoi.number_of_edges(),
-                has_stairs=sparse_stairs_voronoi is not None,
+                has_stairs=(
+                    sparse_stairs_voronoi is not None
+                    and sparse_stairs_voronoi.number_of_nodes() > 0
+                ),
                 output_directory=nav_dir,
             )
 

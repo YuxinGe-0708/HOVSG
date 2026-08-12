@@ -1,0 +1,66 @@
+import unittest
+
+import numpy as np
+import open3d as o3d
+
+from hovsg.graph.floor import Floor
+from hovsg.graph.navigation_graph import NavigationGraph
+
+
+def make_pose(x, y, z):
+    pose = np.eye(4, dtype=np.float64)
+    pose[:3, 3] = [x, y, z]
+    return pose
+
+
+def make_floor_cloud():
+    points = []
+    for x in np.linspace(0.0, 4.0, 21):
+        for z in np.linspace(0.0, 4.0, 21):
+            points.append([x, 0.0, z])
+    cloud = o3d.geometry.PointCloud()
+    cloud.points = o3d.utility.Vector3dVector(np.asarray(points))
+    return cloud
+
+
+class NavigationGraphHandheldTest(unittest.TestCase):
+    def setUp(self):
+        self.cloud = make_floor_cloud()
+        self.floor = Floor("0", name="floor_0")
+        self.floor.pcd = self.cloud
+        self.floor.floor_zero_level = 0.0
+        self.floor.floor_height = 3.0
+        self.nav = NavigationGraph(self.cloud, cell_size=0.1)
+
+    def test_single_floor_keeps_horizontal_trajectory_across_height_changes(self):
+        poses = [
+            make_pose(0.5 + index * 0.3, index * 0.15, 2.0)
+            for index in range(11)
+        ]
+
+        selected = self.nav.get_floor_poses(
+            self.floor, poses, camera_height=1.5, filter_by_height=False
+        )
+        pose_map = self.nav.get_poses_region(
+            selected, radius=0.15, save=False, cluster=False
+        )
+
+        self.assertEqual(len(selected), len(poses))
+        for pose in poses:
+            grid = self.nav.to_grid(pose[:3, 3])[[0, 2]]
+            self.assertEqual(pose_map[grid[1], grid[0]], 1)
+
+    def test_largest_region_never_selects_background(self):
+        binary_map = np.zeros((20, 20), dtype=np.uint8)
+        binary_map[1:10, 1:10] = 1
+        binary_map[15:18, 15:18] = 1
+
+        largest = self.nav.get_largest_region(binary_map)
+
+        self.assertEqual(int(np.count_nonzero(largest)), 81)
+        self.assertTrue(largest[5, 5])
+        self.assertFalse(largest[16, 16])
+
+
+if __name__ == "__main__":
+    unittest.main()
