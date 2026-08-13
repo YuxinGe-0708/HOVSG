@@ -17,12 +17,17 @@ from hovsg.utils.semantic_route import load_navigation_graph, route_to_ranked_ta
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--graph-dir", required=True, type=Path)
-    parser.add_argument("--dataset-dir", required=True, type=Path)
+    parser.add_argument("--dataset-dir", type=Path)
     parser.add_argument("--clip-checkpoint", required=True, type=Path)
     parser.add_argument("--query", required=True)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--start-frame", choices=("first", "last"), default="last")
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument(
+        "--query-only",
+        action="store_true",
+        help="rank semantic objects without requiring a navigation graph",
+    )
     return parser.parse_args()
 
 
@@ -85,9 +90,43 @@ def save_route_image(graph_dir, result, output_path):
 
 def main():
     args = parse_args()
+    object_dir = args.graph_dir / "objects"
+    if not object_dir.is_dir():
+        raise FileNotFoundError(f"Semantic object graph not found: {object_dir}")
+    if not args.clip_checkpoint.is_file():
+        raise FileNotFoundError(f"CLIP checkpoint not found: {args.clip_checkpoint}")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, _, _ = open_clip.create_model_and_transforms(
+        "ViT-H-14", pretrained=str(args.clip_checkpoint), device=device
+    )
+    model.eval()
+    text_feature = get_text_feats_multiple_templates([args.query], model, 1024)[0]
+    ranked_targets = load_ranked_objects(object_dir, text_feature, args.top_k)
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    query_path = args.output_dir / "semantic_query.json"
+    with query_path.open("w", encoding="utf-8") as file:
+        json.dump(
+            {"query": args.query, "ranked_targets": ranked_targets},
+            file,
+            indent=2,
+            ensure_ascii=True,
+        )
+    if args.query_only:
+        print(
+            "[HOVSG][SEMANTIC_QUERY][OK] "
+            f"query={args.query!r} candidates={len(ranked_targets)} "
+            f"best_object_id={ranked_targets[0]['object_id']} "
+            f"best_score={ranked_targets[0]['score']:.4f} output={query_path}",
+            flush=True,
+        )
+        return
+
+    if args.dataset_dir is None:
+        raise ValueError("--dataset-dir is required unless --query-only is used")
     nav_path = args.graph_dir / "nav_graph" / "global_nav_graph_graph.json"
     quality_path = args.graph_dir / "nav_graph" / "navigation_quality.json"
-    object_dir = args.graph_dir / "objects"
     if not quality_path.is_file():
         raise FileNotFoundError(
             f"Navigation quality record not found: {quality_path}. Rebuild this "
@@ -104,18 +143,6 @@ def main():
             "Run graph construction with create_navigation=true and resolve any "
             "navigation safety rejection before planning a route."
         )
-    if not object_dir.is_dir():
-        raise FileNotFoundError(f"Semantic object graph not found: {object_dir}")
-    if not args.clip_checkpoint.is_file():
-        raise FileNotFoundError(f"CLIP checkpoint not found: {args.clip_checkpoint}")
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, _, _ = open_clip.create_model_and_transforms(
-        "ViT-H-14", pretrained=str(args.clip_checkpoint), device=device
-    )
-    model.eval()
-    text_feature = get_text_feats_multiple_templates([args.query], model, 1024)[0]
-    ranked_targets = load_ranked_objects(object_dir, text_feature, args.top_k)
     graph = load_navigation_graph(nav_path)
     start_position = load_start_position(args.dataset_dir, args.start_frame)
     result = route_to_ranked_targets(graph, start_position, ranked_targets)
@@ -130,7 +157,6 @@ def main():
         }
     )
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
     result_path = args.output_dir / "route.json"
     with result_path.open("w", encoding="utf-8") as file:
         json.dump(result, file, indent=2, ensure_ascii=True)
