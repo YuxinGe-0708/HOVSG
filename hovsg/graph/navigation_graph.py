@@ -544,6 +544,8 @@ class NavigationGraph:
         ground_family_exclusion_above_m: float = 0.15,
         obstacle_min_points_per_cell: int = 3,
         obstacle_inflation_radius_m: float = 0.38,
+        pose_center_radius_m: float = 0.15,
+        max_raw_obstacle_pose_center_overlap_ratio: float = 0.15,
     ) -> np.ndarray:
         """Get the free region of the floor as a grid map.
 
@@ -608,6 +610,21 @@ class NavigationGraph:
             filter_size=0,
             min_points_per_cell=obstacle_min_points_per_cell,
         )
+        pose_center_map = self.get_poses_region(
+            floor_poses_list,
+            radius=pose_center_radius_m,
+            save=False,
+            cluster=cluster_pose_heights,
+        )
+        pose_center_cells = int(np.count_nonzero(pose_center_map))
+        raw_obstacle_pose_center_overlap_cells = int(
+            np.count_nonzero(
+                np.logical_and(raw_obstacle_map > 0, pose_center_map > 0)
+            )
+        )
+        raw_obstacle_pose_center_overlap_ratio = float(
+            raw_obstacle_pose_center_overlap_cells / max(pose_center_cells, 1)
+        )
         self.map = self.create_occupancy_grid(
             obstaces_vertices,
             dilation_radius=inflation_diameter_cells,
@@ -635,6 +652,17 @@ class NavigationGraph:
             main_free_cells=int(np.count_nonzero(main_free_map)),
             obstacle_min_points_per_cell=int(obstacle_min_points_per_cell),
             obstacle_inflation_radius_m=float(obstacle_inflation_radius_m),
+            pose_center_radius_m=float(pose_center_radius_m),
+            pose_center_cells=pose_center_cells,
+            raw_obstacle_pose_center_overlap_cells=(
+                raw_obstacle_pose_center_overlap_cells
+            ),
+            raw_obstacle_pose_center_overlap_ratio=(
+                raw_obstacle_pose_center_overlap_ratio
+            ),
+            max_raw_obstacle_pose_center_overlap_ratio=float(
+                max_raw_obstacle_pose_center_overlap_ratio
+            ),
         )
         if save:
             cv2.imwrite(
@@ -656,6 +684,25 @@ class NavigationGraph:
             cv2.imwrite(
                 os.path.join(floor_dir, "floor_free_main.png"),
                 main_free_map.astype(np.uint8) * 255,
+            )
+            cv2.imwrite(
+                os.path.join(floor_dir, "poses_center_map.png"),
+                pose_center_map.astype(np.uint8) * 255,
+            )
+        if (
+            pose_center_cells > 0
+            and raw_obstacle_pose_center_overlap_ratio
+            > max_raw_obstacle_pose_center_overlap_ratio
+        ):
+            raise RuntimeError(
+                "Navigation rejected because the reconstructed obstacle cloud "
+                "contradicts the recorded camera trajectory: raw obstacles cover "
+                f"{raw_obstacle_pose_center_overlap_ratio:.1%} of the "
+                f"{pose_center_radius_m:.2f} m trajectory center region, above "
+                f"the {max_raw_obstacle_pose_center_overlap_ratio:.1%} limit. "
+                "This indicates unresolved SLAM ghosting/pose drift; inspect "
+                "poses_center_map.png, floor_obstacles_raw.png, and "
+                "ground_estimation.json before using routes."
             )
         return main_free_map
 
@@ -1426,6 +1473,14 @@ class NavigationGraph:
             ),
             obstacle_inflation_radius_m=float(
                 navigation_config.get("obstacle_inflation_radius_m", 0.38)
+            ),
+            pose_center_radius_m=float(
+                navigation_config.get("pose_center_radius_m", 0.15)
+            ),
+            max_raw_obstacle_pose_center_overlap_ratio=float(
+                navigation_config.get(
+                    "max_raw_obstacle_pose_center_overlap_ratio", 0.15
+                )
             ),
         ).astype(np.uint8)
         minimum_navigable_area_m2 = float(

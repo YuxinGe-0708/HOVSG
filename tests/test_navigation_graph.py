@@ -144,6 +144,33 @@ class NavigationGraphHandheldTest(unittest.TestCase):
 
         self.assertEqual(loaded.ground_height_family, [-0.40, 0.0, 0.36])
 
+    def test_navigation_rejects_obstacles_on_recorded_path_center(self):
+        points = np.vstack(
+            (
+                np.asarray(self.cloud.points),
+                np.repeat([[2.0, 0.50, 2.0]], 5, axis=0),
+            )
+        )
+        cloud = o3d.geometry.PointCloud()
+        cloud.points = o3d.utility.Vector3dVector(points)
+        nav = NavigationGraph(cloud, cell_size=0.1)
+
+        with self.assertRaisesRegex(RuntimeError, "contradicts the recorded"):
+            nav.get_main_free_map(
+                cloud,
+                {
+                    "floor_zero_level": 0.0,
+                    "floor_height": 3.0,
+                    "ground_height_family": [0.0],
+                },
+                floor_poses_list=[make_pose(2.0, 1.0, 2.0)],
+                save=False,
+                pose_region_radius=0.2,
+                pose_center_radius_m=0.05,
+                obstacle_inflation_radius_m=0.0,
+                max_raw_obstacle_pose_center_overlap_ratio=0.10,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

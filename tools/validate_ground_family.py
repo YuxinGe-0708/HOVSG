@@ -213,6 +213,36 @@ def main():
                 np.count_nonzero(obstacle_inflated & pose_center)
                 / max(pose_center_cells, 1)
             )
+            obstacle_cells = np.floor(
+                (points[obstacle_points][:, [0, 2]] - minimum[[0, 2]]) / 0.05
+            ).astype(int)
+            valid_obstacle_cells = (
+                (obstacle_cells[:, 0] >= 0)
+                & (obstacle_cells[:, 0] < shape[1])
+                & (obstacle_cells[:, 1] >= 0)
+                & (obstacle_cells[:, 1] < shape[0])
+            )
+            obstacle_in_pose_center = np.zeros(
+                np.count_nonzero(obstacle_points), dtype=bool
+            )
+            obstacle_in_pose_center[valid_obstacle_cells] = pose_center[
+                obstacle_cells[valid_obstacle_cells, 1],
+                obstacle_cells[valid_obstacle_cells, 0],
+            ]
+            obstacle_pose_heights = points[obstacle_points][
+                obstacle_in_pose_center, 1
+            ]
+            bins = np.arange(min(family), ceiling + 0.1001, 0.10)
+            counts, edges = np.histogram(obstacle_pose_heights, bins=bins)
+            result["pose_center_obstacle_height_histogram"] = [
+                {
+                    "min_height_m": float(edges[index]),
+                    "max_height_m": float(edges[index + 1]),
+                    "points": int(count),
+                }
+                for index, count in enumerate(counts)
+                if count
+            ]
             save_mask(args.output / "pose_center_region.png", pose_center)
             overlay[poses] = np.maximum(overlay[poses], [40, 110, 235])
         else:

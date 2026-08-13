@@ -157,6 +157,11 @@ navigation:
   obstacle_max_height_m: 1.80
   ceiling_clearance_m: 0.20
   obstacle_min_points_per_cell: 3
+  # Reject a navigation map when even the narrow center of the recorded path
+  # is occupied. Clearing these cells would hide unresolved SLAM ghosting and
+  # could remove real obstacles, so real-robot navigation fails closed.
+  pose_center_radius_m: 0.15
+  max_raw_obstacle_pose_center_overlap_ratio: 0.15
   minimum_navigable_area_m2: 0.50
   # When floor detection returns one floor, navigation automatically ignores
   # camera height and disables stair inference for handheld recordings.
