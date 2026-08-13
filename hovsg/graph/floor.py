@@ -26,6 +26,7 @@ class Floor:
         self.vertices = []  # indices of the floor in the point cloud 8 vertices
         self.floor_height = None  # Height of the floor
         self.floor_zero_level = None  # Zero level of the floor
+        self.ground_height_family = []  # repeated ground layers from pose drift
 
     def add_room(self, room):
         """
@@ -49,6 +50,7 @@ class Floor:
             "vertices": self.vertices.tolist(),
             "floor_height": self.floor_height,
             "floor_zero_level": self.floor_zero_level,
+            "ground_height_family": self.ground_height_family,
         }
         with open(os.path.join(path, str(self.floor_id) + ".json"), "w") as outfile:
             json.dump(metadata, outfile)
@@ -68,6 +70,9 @@ class Floor:
             self.vertices = np.asarray(metadata["vertices"])
             self.floor_height = metadata["floor_height"]
             self.floor_zero_level = metadata["floor_zero_level"]
+            self.ground_height_family = metadata.get(
+                "ground_height_family", [self.floor_zero_level]
+            )
 
     def __str__(self):
         return f"Floor ID: {self.floor_id}, Name: {self.name}, Rooms: {len(self.rooms)}"

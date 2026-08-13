@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 
 import numpy as np
@@ -100,6 +101,48 @@ class NavigationGraphHandheldTest(unittest.TestCase):
         )
         self.assertEqual(grid[sparse_cell[1], sparse_cell[0]], 0)
         self.assertEqual(grid[dense_cell[1], dense_cell[0]], 1)
+
+    def test_ground_family_excludes_drift_layers_but_keeps_table(self):
+        points = np.array(
+            [
+                [0.0, -0.40, 0.0],
+                [1.0, 0.00, 1.0],
+                [2.0, 0.36, 2.0],
+                [2.5, 0.78, 2.5],
+                [2.7, 0.20, 2.7],
+                [3.0, 2.70, 3.0],
+            ],
+            dtype=np.float64,
+        )
+        cloud = o3d.geometry.PointCloud()
+        cloud.points = o3d.utility.Vector3dVector(points)
+        info = {
+            "floor_zero_level": 0.0,
+            "floor_height": 2.7,
+            "ground_height_family": [-0.40, 0.0, 0.36],
+            "ground_family_exclusion_below_m": 0.10,
+            "ground_family_exclusion_above_m": 0.15,
+        }
+
+        ground = self.nav.floor_region_vertices(cloud, info)
+        obstacles = self.nav.obstacles_vertices(cloud, info)
+
+        self.assertEqual(len(ground), 3)
+        self.assertEqual(len(obstacles), 2)
+        np.testing.assert_allclose(obstacles, [[2.5, 2.5], [2.7, 2.7]])
+
+    def test_floor_round_trip_preserves_ground_height_family(self):
+        self.floor.vertices = np.asarray(
+            self.floor.pcd.get_axis_aligned_bounding_box().get_box_points()
+        )
+        self.floor.ground_height_family = [-0.40, 0.0, 0.36]
+
+        with tempfile.TemporaryDirectory() as directory:
+            self.floor.save(directory)
+            loaded = Floor("0")
+            loaded.load(directory)
+
+        self.assertEqual(loaded.ground_height_family, [-0.40, 0.0, 0.36])
 
 
 if __name__ == "__main__":

@@ -119,6 +119,16 @@ pipeline:
   ground_pose_proximity_m: 1.00
   ground_min_camera_height_support_ratio: 0.50
   ground_min_pose_proximity_ratio: 0.15
+  # A drifting trajectory can reproduce one physical floor at several Y
+  # levels. Keep only large, connected, horizontal, trajectory-supported peaks
+  # near the best ground anchor; small table-like peaks remain obstacles.
+  ground_family_enabled: true
+  ground_family_max_height_delta_m: 0.90
+  ground_family_min_coverage_ratio: 0.35
+  ground_family_min_connected_fraction: 0.65
+  ground_family_min_camera_height_support_ratio: 0.65
+  ground_family_min_pose_proximity_ratio: 0.15
+  ground_family_min_verticality: 0.98
   # Fail closed instead of silently treating a low outlier quantile as ground.
   ground_allow_quantile_fallback: false
   single_floor_min_room_height_m: 2.0
@@ -141,6 +151,8 @@ navigation:
   # by the robot radius plus its safety margin.
   ground_band_below_m: 0.08
   ground_band_above_m: 0.12
+  ground_family_exclusion_below_m: 0.10
+  ground_family_exclusion_above_m: 0.15
   obstacle_min_height_m: 0.15
   obstacle_max_height_m: 1.80
   ceiling_clearance_m: 0.20

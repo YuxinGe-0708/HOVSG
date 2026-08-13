@@ -269,6 +269,49 @@ def estimate_single_floor_geometry(
             "plane_residual_median_m": 0.0,
         }
 
+    family_enabled = bool(_value(config, "ground_family_enabled", True))
+    family_max_height_delta = float(
+        _value(config, "ground_family_max_height_delta_m", 0.9)
+    )
+    family_min_coverage_ratio = float(
+        _value(config, "ground_family_min_coverage_ratio", 0.35)
+    )
+    family_min_connected_fraction = float(
+        _value(config, "ground_family_min_connected_fraction", 0.65)
+    )
+    family_min_camera_height_support = float(
+        _value(config, "ground_family_min_camera_height_support_ratio", 0.65)
+    )
+    family_min_pose_proximity = float(
+        _value(config, "ground_family_min_pose_proximity_ratio", 0.15)
+    )
+    family_min_verticality = float(
+        _value(config, "ground_family_min_verticality", 0.98)
+    )
+    anchor_coverage = max(float(ground["coverage_area_m2"]), 1e-9)
+    ground_family = []
+    if family_enabled and not fallback_used:
+        for candidate in candidates:
+            if abs(candidate["height"] - floor_zero_level) > family_max_height_delta:
+                continue
+            if (
+                candidate["coverage_area_m2"]
+                < anchor_coverage * family_min_coverage_ratio
+                or candidate["connected_fraction"]
+                < family_min_connected_fraction
+                or candidate["camera_height_support"]
+                < family_min_camera_height_support
+                or candidate["camera_proximity_support"]
+                < family_min_pose_proximity
+                or candidate["verticality"] < family_min_verticality
+            ):
+                continue
+            ground_family.append(candidate)
+    if not ground_family:
+        ground_family = [ground]
+    ground_family = sorted(ground_family, key=lambda item: item["height"])
+    ground_height_family = [float(item["height"]) for item in ground_family]
+
     min_room_height = float(_value(config, "single_floor_min_room_height_m", 2.0))
     max_room_height = float(_value(config, "single_floor_max_room_height_m", 4.0))
     ceiling_min_camera_clearance = float(
@@ -310,6 +353,8 @@ def estimate_single_floor_geometry(
         "floor_zero_level": floor_zero_level,
         "floor_upper_level": floor_upper_level,
         "ground": ground,
+        "ground_family": ground_family,
+        "ground_height_family": ground_height_family,
         "ceiling": ceiling,
         "ceiling_source": ceiling_source,
         "fallback_used": fallback_used,

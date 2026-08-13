@@ -163,18 +163,49 @@ class NavigationGraph:
         if height_region is None:
             height_region = [0.15, 1.8]
         floor_pcd = np.array(floor_pcd.points)
-        floor_zero_level = floor_info["floor_zero_level"]
+        floor_zero_level = float(floor_info["floor_zero_level"])
+        ground_height_family = np.asarray(
+            floor_info.get("ground_height_family") or [floor_zero_level],
+            dtype=np.float64,
+        )
+        ground_height_family = ground_height_family[
+            np.isfinite(ground_height_family)
+        ]
+        if ground_height_family.size == 0:
+            ground_height_family = np.asarray([floor_zero_level])
         ceiling_clearance = float(floor_info.get("ceiling_clearance_m", 0.20))
         ceiling_height = floor_zero_level + float(floor_info["floor_height"])
-        obstacle_upper = min(
-            floor_zero_level + float(height_region[1]),
-            ceiling_height - ceiling_clearance,
+        exclusion_below = float(
+            floor_info.get("ground_family_exclusion_below_m", 0.10)
         )
-        # Exclude the fitted ground band and ceiling band explicitly. This
-        # prevents floor/ceiling duplicates from filling the obstacle grid.
-        floor_pcd = floor_pcd[floor_pcd[:, 1] < obstacle_upper]
+        exclusion_above = float(
+            floor_info.get("ground_family_exclusion_above_m", 0.15)
+        )
+
+        # Pose drift may reproduce the same physical floor at several global
+        # heights. Exclude points in any credible ground band, then classify an
+        # obstacle relative to the highest ground layer not above it. Using the
+        # absolute nearest layer would let a higher drifted floor hide a real
+        # low obstacle immediately below that layer.
+        relative_heights = floor_pcd[:, 1, None] - ground_height_family[None, :]
+        inside_ground_family = np.any(
+            np.logical_and(
+                relative_heights >= -exclusion_below,
+                relative_heights <= exclusion_above,
+            ),
+            axis=1,
+        )
+        relative_to_layer_below = np.where(
+            relative_heights >= 0.0, relative_heights, np.inf
+        )
+        obstacle_relative_height = np.min(relative_to_layer_below, axis=1)
+        obstacle_height = np.logical_and(
+            obstacle_relative_height >= float(height_region[0]),
+            obstacle_relative_height <= float(height_region[1]),
+        )
+        below_ceiling = floor_pcd[:, 1] < ceiling_height - ceiling_clearance
         floor_pcd = floor_pcd[
-            floor_pcd[:, 1] > floor_zero_level + float(height_region[0])
+            ~inside_ground_family & obstacle_height & below_ceiling
         ]
         # project to 2D
         floor_pcd = floor_pcd[:, [0, 2]]
@@ -203,13 +234,25 @@ class NavigationGraph:
         if ground_band is None:
             ground_band = [-0.08, 0.12]
         floor_pcd = np.array(floor_pcd.points)
-        floor_relative_height = floor_pcd[:, 1] - floor_info["floor_zero_level"]
-        floor_pcd = floor_pcd[
-            np.logical_and(
-                floor_relative_height >= float(ground_band[0]),
-                floor_relative_height <= float(ground_band[1]),
-            )
+        floor_zero_level = float(floor_info["floor_zero_level"])
+        ground_height_family = np.asarray(
+            floor_info.get("ground_height_family") or [floor_zero_level],
+            dtype=np.float64,
+        )
+        ground_height_family = ground_height_family[
+            np.isfinite(ground_height_family)
         ]
+        if ground_height_family.size == 0:
+            ground_height_family = np.asarray([floor_zero_level])
+        relative_heights = floor_pcd[:, 1, None] - ground_height_family[None, :]
+        ground_evidence = np.any(
+            np.logical_and(
+                relative_heights >= float(ground_band[0]),
+                relative_heights <= float(ground_band[1]),
+            ),
+            axis=1,
+        )
+        floor_pcd = floor_pcd[ground_evidence]
         floor_pcd = floor_pcd[:, [0, 2]]
         return floor_pcd
 
@@ -497,6 +540,8 @@ class NavigationGraph:
         ground_band_below_m: float = 0.08,
         ground_band_above_m: float = 0.12,
         ceiling_clearance_m: float = 0.20,
+        ground_family_exclusion_below_m: float = 0.10,
+        ground_family_exclusion_above_m: float = 0.15,
         obstacle_min_points_per_cell: int = 3,
         obstacle_inflation_radius_m: float = 0.38,
     ) -> np.ndarray:
@@ -514,6 +559,12 @@ class NavigationGraph:
         """
         floor_info = dict(floor_info)
         floor_info["ceiling_clearance_m"] = ceiling_clearance_m
+        floor_info["ground_family_exclusion_below_m"] = (
+            ground_family_exclusion_below_m
+        )
+        floor_info["ground_family_exclusion_above_m"] = (
+            ground_family_exclusion_above_m
+        )
         obstaces_vertices = self.obstacles_vertices(
             floor_pcd,
             floor_info,
@@ -987,6 +1038,9 @@ class NavigationGraph:
         floor_info = {
             "floor_zero_level": floor.floor_zero_level,
             "floor_height": floor.floor_height,
+            "ground_height_family": list(
+                floor.ground_height_family or [floor.floor_zero_level]
+            ),
         }
         top_down = self.get_top_down_rgb_map(floor_pcd, floor_info, floor_dir)
         pose_heights = np.array([pose[1, 3] - 1.5 for pose in poses_list])
@@ -1102,6 +1156,9 @@ class NavigationGraph:
         floor_info = {
             "floor_zero_level": floor.floor_zero_level,
             "floor_height": floor.floor_height,
+            "ground_height_family": list(
+                floor.ground_height_family or [floor.floor_zero_level]
+            ),
         }
         top_down = self.get_top_down_rgb_map(floor_pcd, floor_info, floor_dir)
         pose_heights = np.array([pose[1, 3] for pose in poses_list])
@@ -1331,6 +1388,9 @@ class NavigationGraph:
         floor_info = {
             "floor_zero_level": floor.floor_zero_level,
             "floor_height": floor.floor_height,
+            "ground_height_family": list(
+                floor.ground_height_family or [floor.floor_zero_level]
+            ),
         }
         navigation_config = navigation_config or {}
         main_free_map = self.get_main_free_map(
@@ -1354,6 +1414,12 @@ class NavigationGraph:
             ),
             ceiling_clearance_m=float(
                 navigation_config.get("ceiling_clearance_m", 0.20)
+            ),
+            ground_family_exclusion_below_m=float(
+                navigation_config.get("ground_family_exclusion_below_m", 0.10)
+            ),
+            ground_family_exclusion_above_m=float(
+                navigation_config.get("ground_family_exclusion_above_m", 0.15)
             ),
             obstacle_min_points_per_cell=int(
                 navigation_config.get("obstacle_min_points_per_cell", 3)

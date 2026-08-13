@@ -890,6 +890,9 @@ class Graph:
         )
         floor_zero_level = float(result["floor_zero_level"])
         floor_upper_level = float(result["floor_upper_level"])
+        ground_height_family = [
+            float(height) for height in result["ground_height_family"]
+        ]
         ground = result["ground"]
         print_status(
             "GROUND_ESTIMATION",
@@ -915,6 +918,8 @@ class Graph:
             ground_plane_residual_median_m=float(
                 ground.get("plane_residual_median_m", 0.0)
             ),
+            ground_family_size=len(ground_height_family),
+            ground_height_family_m=ground_height_family,
             ceiling_source=result["ceiling_source"],
         )
         if self.cfg.pipeline.save_intermediate_results:
@@ -926,6 +931,8 @@ class Graph:
                 "fallback_allowed": bool(result["fallback_allowed"]),
                 "ceiling_source": result["ceiling_source"],
                 "ground": result["ground"],
+                "ground_family": result["ground_family"],
+                "ground_height_family_m": ground_height_family,
                 "ceiling": result["ceiling"],
                 "candidates": result["candidates"],
             }
@@ -943,7 +950,19 @@ class Graph:
             )
             for candidate in result["candidates"]:
                 plt.axvline(candidate["height"], color="orange", alpha=0.35)
-            plt.axvline(floor_zero_level, color="green", label="selected ground")
+            for index, height in enumerate(ground_height_family):
+                plt.axvline(
+                    height,
+                    color="green",
+                    alpha=0.65,
+                    label="ground height family" if index == 0 else None,
+                )
+            plt.axvline(
+                floor_zero_level,
+                color="darkgreen",
+                linewidth=2,
+                label="selected ground anchor",
+            )
             plt.axvline(floor_upper_level, color="blue", label="ceiling/upper bound")
             plt.xlabel("Y height (m)")
             plt.ylabel("smoothed point count")
@@ -961,13 +980,14 @@ class Graph:
                 "tmp/ground_estimation.png; refusing to build navigation from an "
                 "unverified height quantile."
             )
-        return floor_zero_level, floor_upper_level
+        return floor_zero_level, floor_upper_level, ground_height_family
 
     def _create_single_floor(
         self,
         floor_zero_level,
         floor_upper_level,
         reason,
+        ground_height_family=None,
     ):
         """Create a single Floor object from robust vertical bounds."""
         points = np.asarray(self.full_pcd.points)
@@ -977,7 +997,14 @@ class Graph:
         )
         min_bound = np.min(points, axis=0)
         max_bound = np.max(points, axis=0)
-        min_bound[1] = floor_zero_level - lower_margin
+        ground_height_family = sorted(
+            float(height)
+            for height in (ground_height_family or [floor_zero_level])
+            if np.isfinite(height)
+        )
+        if not ground_height_family:
+            ground_height_family = [float(floor_zero_level)]
+        min_bound[1] = min(ground_height_family) - lower_margin
         max_bound[1] = floor_upper_level
         floor_pcd = self.full_pcd.crop(
             o3d.geometry.AxisAlignedBoundingBox(
@@ -995,6 +1022,7 @@ class Graph:
         floor.pcd = floor_pcd
         floor.floor_zero_level = float(floor_zero_level)
         floor.floor_height = float(floor_upper_level - floor_zero_level)
+        floor.ground_height_family = ground_height_family
         floor.vertices = np.asarray(
             floor_pcd.get_axis_aligned_bounding_box().get_box_points()
         )
@@ -1007,6 +1035,8 @@ class Graph:
             floor_zero_level_m=floor.floor_zero_level,
             floor_upper_level_m=float(floor_upper_level),
             floor_height_m=floor.floor_height,
+            ground_family_size=len(ground_height_family),
+            ground_height_family_m=ground_height_family,
             retained_points=len(floor.pcd.points),
         )
         return [floor]
@@ -1044,13 +1074,14 @@ class Graph:
                     f"({min_floor_height:.3f}m)"
                 )
             )
-            floor_zero_level, floor_upper_level = (
+            floor_zero_level, floor_upper_level, ground_height_family = (
                 self._estimate_single_floor_geometry(reason)
             )
             return self._create_single_floor(
                 floor_zero_level,
                 floor_upper_level,
                 reason,
+                ground_height_family=ground_height_family,
             )
         # ========== 原有多楼层分割逻辑 ==========
         print_status(
@@ -1151,7 +1182,7 @@ class Graph:
             floor_peak = (
                 float(clustred_peaks[0]) if len(clustred_peaks) == 1 else None
             )
-            floor_zero_level, floor_upper_level = (
+            floor_zero_level, floor_upper_level, ground_height_family = (
                 self._estimate_single_floor_geometry(
                     "only_one_height_peak"
                     if floor_peak is not None
@@ -1166,6 +1197,7 @@ class Graph:
                     if floor_peak is not None
                     else "no_height_peaks"
                 ),
+                ground_height_family=ground_height_family,
             )
 
         floors = []
