@@ -86,7 +86,18 @@ def save_route_image(graph_dir, result, output_path):
 def main():
     args = parse_args()
     nav_path = args.graph_dir / "nav_graph" / "global_nav_graph_graph.json"
+    quality_path = args.graph_dir / "nav_graph" / "navigation_quality.json"
     object_dir = args.graph_dir / "objects"
+    if not quality_path.is_file():
+        raise FileNotFoundError(
+            f"Navigation quality record not found: {quality_path}. Rebuild this "
+            "output with the current code and create_navigation=true; legacy or "
+            "safety-rejected navigation graphs cannot be used for routing."
+        )
+    with quality_path.open("r", encoding="utf-8") as file:
+        quality = json.load(file)
+    if quality.get("passed") is not True:
+        raise RuntimeError(f"Navigation quality gate did not pass: {quality_path}")
     if not nav_path.is_file():
         raise FileNotFoundError(
             f"Verified navigation graph not found: {nav_path}. "

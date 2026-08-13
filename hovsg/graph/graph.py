@@ -1848,6 +1848,11 @@ class Graph:
         # create a folder for the resulting navigation graph
         nav_dir = os.path.join(self.cfg.main.save_path, "graph", "nav_graph")
         os.makedirs(nav_dir, exist_ok=True)
+        quality_path = os.path.join(nav_dir, "navigation_quality.json")
+        global_graph_path = os.path.join(nav_dir, "global_nav_graph_graph.json")
+        for stale_output in (quality_path, global_graph_path):
+            if os.path.exists(stale_output):
+                os.remove(stale_output)
 
         # get pose list
         poses_list = []
@@ -2013,6 +2018,17 @@ class Graph:
             global_voronoi = last_nav_graph.sparse_floor_voronoi
 
         NavigationGraph.save_voronoi_graph(global_voronoi, nav_dir, "global_nav_graph")
+        with open(quality_path, "w", encoding="utf-8") as file:
+            json.dump(
+                {
+                    "passed": True,
+                    "nodes": global_voronoi.number_of_nodes(),
+                    "edges": global_voronoi.number_of_edges(),
+                    "quality_gate": "trajectory_obstacle_overlap_and_navigable_area",
+                },
+                file,
+                indent=2,
+            )
         print_status(
             "NAVIGATION_GLOBAL",
             "OK",
