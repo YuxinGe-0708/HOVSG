@@ -11,7 +11,11 @@ import torch
 
 from hovsg.dataloader.real_robot import RealRobotDataset
 from hovsg.utils.clip_utils import get_text_feats_multiple_templates
-from hovsg.utils.semantic_route import load_navigation_graph, route_to_ranked_targets
+from hovsg.utils.semantic_route import (
+    load_navigation_graph,
+    object_position_from_metadata,
+    route_to_ranked_targets,
+)
 
 
 def parse_args():
@@ -38,10 +42,14 @@ def load_ranked_objects(objects_dir, text_feature, top_k):
             metadata = json.load(file)
         embedding = np.asarray(metadata.get("embedding", []), dtype=np.float32)
         vertices = np.asarray(metadata.get("vertices", []), dtype=np.float64)
-        if embedding.ndim != 1 or embedding.size == 0 or vertices.shape != (8, 3):
+        if embedding.ndim != 1 or embedding.size == 0:
             continue
         norm = float(np.linalg.norm(embedding))
-        if norm <= 0 or not np.isfinite(norm) or not np.all(np.isfinite(vertices)):
+        if norm <= 0 or not np.isfinite(norm):
+            continue
+        try:
+            position = object_position_from_metadata(metadata_path, vertices)
+        except ValueError:
             continue
         candidates.append(
             {
@@ -49,7 +57,7 @@ def load_ranked_objects(objects_dir, text_feature, top_k):
                 "room_id": str(metadata["room_id"]),
                 "name": str(metadata.get("name", "")),
                 "score": float(np.dot(text_feature, embedding / norm)),
-                "position": vertices.mean(axis=0).tolist(),
+                "position": position.tolist(),
             }
         )
     if not candidates:

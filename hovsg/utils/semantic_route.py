@@ -5,6 +5,36 @@ from pathlib import Path
 
 import networkx as nx
 import numpy as np
+import open3d as o3d
+
+
+def object_position_from_metadata(metadata_path, vertices):
+    """Return a 3-D object center for both historical metadata formats."""
+    metadata_path = Path(metadata_path)
+    vertices = np.asarray(vertices, dtype=np.float64)
+    if vertices.shape == (8, 3) and np.isfinite(vertices).all():
+        return vertices.mean(axis=0)
+    if (
+        vertices.ndim == 2
+        and vertices.shape[1] == 2
+        and len(vertices) > 0
+        and np.isfinite(vertices).all()
+    ):
+        point_cloud_path = metadata_path.with_suffix(".ply")
+        if not point_cloud_path.is_file():
+            raise ValueError(
+                f"Object has 2-D vertices but no point cloud: {point_cloud_path}"
+            )
+        point_cloud = o3d.io.read_point_cloud(str(point_cloud_path))
+        points = np.asarray(point_cloud.points, dtype=np.float64)
+        if points.ndim != 2 or points.shape[1] != 3 or len(points) == 0:
+            raise ValueError(f"Object point cloud is empty: {point_cloud_path}")
+        if not np.isfinite(points).all():
+            raise ValueError(f"Object point cloud contains invalid points: {point_cloud_path}")
+        return points.mean(axis=0)
+    raise ValueError(
+        f"Unsupported object vertices shape {vertices.shape}: {metadata_path}"
+    )
 
 
 def load_navigation_graph(path):

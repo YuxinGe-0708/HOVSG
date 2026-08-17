@@ -4,8 +4,14 @@ import unittest
 from pathlib import Path
 
 import networkx as nx
+import numpy as np
+import open3d as o3d
 
-from hovsg.utils.semantic_route import load_navigation_graph, route_to_ranked_targets
+from hovsg.utils.semantic_route import (
+    load_navigation_graph,
+    object_position_from_metadata,
+    route_to_ranked_targets,
+)
 
 
 class SemanticRouteTest(unittest.TestCase):
@@ -42,6 +48,22 @@ class SemanticRouteTest(unittest.TestCase):
             path.write_text('{"nodes": [], "links": []}', encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "empty"):
                 load_navigation_graph(path)
+
+    def test_object_position_loads_historical_2d_vertices_from_ply(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metadata_path = Path(directory) / "object.json"
+            cloud = o3d.geometry.PointCloud()
+            cloud.points = o3d.utility.Vector3dVector(
+                np.asarray([[1.0, 0.2, 3.0], [3.0, 0.8, 5.0]])
+            )
+            o3d.io.write_point_cloud(str(metadata_path.with_suffix(".ply")), cloud)
+
+            position = object_position_from_metadata(
+                metadata_path,
+                [[1.0, 3.0], [3.0, 5.0]],
+            )
+
+        np.testing.assert_allclose(position, [2.0, 0.5, 4.0])
 
 
 if __name__ == "__main__":
