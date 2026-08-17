@@ -56,8 +56,8 @@ pipeline:
   # dense while semantic coverage is high enough for handheld objects.
   semantic_skip_frames: 2
   # Keep a frame when either motion threshold is reached.
-  keyframe_translation_m: 0.10
-  keyframe_rotation_deg: 10.0
+  keyframe_translation_m: 0.05
+  keyframe_rotation_deg: 5.0
   # Reject discontinuous localization poses instead of corrupting the map.
   max_pose_translation_jump_m: 0.75
   max_pose_rotation_jump_deg: 45.0
