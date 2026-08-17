@@ -778,19 +778,22 @@ class Graph:
             masks_after=len(self.mask_pcds),
         )
 
-        # remove any small pcds
+        # Remove small masks before fusing object features. The threshold is
+        # configurable so real-robot runs can reject fragmented masks without
+        # silently changing the feature/mask alignment.
+        min_pcd_points = int(self.cfg.pipeline.get("min_pcd_points", 100))
         masks_before_size_filter = len(self.mask_pcds)
         self.mask_pcds = [
             pcd
             for pcd in self.mask_pcds
-            if not pcd.is_empty() and len(pcd.points) >= 100
+            if not pcd.is_empty() and len(pcd.points) >= min_pcd_points
         ]
         print_status(
             "MASK_SIZE_FILTER",
             "OK",
             masks_before=masks_before_size_filter,
             masks_after=len(self.mask_pcds),
-            minimum_points=100,
+            minimum_points=min_pcd_points,
         )
         # fuse point features in every 3d mask
         masks_feats = []
@@ -1527,8 +1530,59 @@ class Graph:
         Per floor, assign each object to the room with the highest overlap.
         :param save_dir: str, optional, The path to save the intermediate results
         """
-        for i, pcd in enumerate(self.mask_pcds):
-            self.mask_pcds[i] = pcd_denoise_dbscan(pcd, eps=0.05, min_points=10)
+        object_dbscan_eps = float(
+            self.cfg.pipeline.get("object_dbscan_eps_m", 0.07)
+        )
+        object_dbscan_min_points = int(
+            self.cfg.pipeline.get("object_dbscan_min_points", 5)
+        )
+        object_dbscan_min_cluster_points = int(
+            self.cfg.pipeline.get("object_dbscan_min_cluster_points", 8)
+        )
+        object_dbscan_min_cluster_ratio = float(
+            self.cfg.pipeline.get("object_dbscan_min_cluster_ratio", 0.02)
+        )
+        min_pcd_points = int(self.cfg.pipeline.get("min_pcd_points", 100))
+
+        # Keep all supported DBSCAN components and filter masks only after
+        # denoising. Features must be filtered by the same indices.
+        denoised_masks = []
+        denoised_features = []
+        removed_empty = 0
+        removed_small = 0
+        for index, pcd in enumerate(self.mask_pcds):
+            denoised = pcd_denoise_dbscan(
+                pcd,
+                eps=object_dbscan_eps,
+                min_points=object_dbscan_min_points,
+                keep_all_clusters=True,
+                min_cluster_points=object_dbscan_min_cluster_points,
+                min_cluster_ratio=object_dbscan_min_cluster_ratio,
+            )
+            if denoised is None or denoised.is_empty():
+                removed_empty += 1
+                continue
+            if len(denoised.points) < min_pcd_points:
+                removed_small += 1
+                continue
+            denoised_masks.append(denoised)
+            denoised_features.append(self.mask_feats[index])
+
+        masks_before_object_filter = len(self.mask_pcds)
+        self.mask_pcds = denoised_masks
+        self.mask_feats = denoised_features
+        print_status(
+            "OBJECT_MASK_FILTER",
+            "OK",
+            masks_before=masks_before_object_filter,
+            masks_after=len(self.mask_pcds),
+            removed_empty=removed_empty,
+            removed_small=removed_small,
+            minimum_points=min_pcd_points,
+            dbscan_eps_m=object_dbscan_eps,
+            dbscan_min_points=object_dbscan_min_points,
+            dbscan_keep_all_clusters=True,
+        )
         text_feats, classes = get_label_feats(
             self.clip_model,
             self.clip_feat_dim,

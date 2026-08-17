@@ -31,12 +31,12 @@ models:
   sam:
     type: vit_h
     checkpoint: /mnt/data/real_camera/isaac/HOV-SG-graph-dev/checkpoints/sam_vit_h_4b8939.pth
-    points_per_side: 12
-    pred_iou_thresh: 0.88
+    points_per_side: 16
+    pred_iou_thresh: 0.86
     points_per_batch: 144
     crop_n_layers: 0
-    stability_score_thresh: 0.95
-    min_mask_region_area: 100
+    stability_score_thresh: 0.92
+    min_mask_region_area: 50
 
 pipeline:
   extract_semantics: false
@@ -52,7 +52,9 @@ pipeline:
   # geometry keyframe. This keeps the map dense without paying semantic-model
   # cost for every keyframe.
   geometry_skip_frames: 1
-  semantic_skip_frames: 10
+  # Run SAM/CLIP on every second accepted geometry keyframe. Geometry remains
+  # dense while semantic coverage is high enough for handheld objects.
+  semantic_skip_frames: 2
   # Keep a frame when either motion threshold is reached.
   keyframe_translation_m: 0.10
   keyframe_rotation_deg: 10.0
@@ -68,19 +70,20 @@ pipeline:
   # Downsample the accumulated point cloud every N accepted keyframes.
   pointcloud_fusion_batch_size: 10
   log_every_n_frames: 1 # print progress every n frames
-  min_pcd_points: 30
+  # Final object masks below this size are not reliable navigation targets.
+  min_pcd_points: 100
 
   # Aurora 930 driver is configured to keep 150-4000 mm.
   min_depth_m: 0.15
   max_depth_m: 4.0
-  association_distance_m: 0.05
+  association_distance_m: 0.07
 
   outlier_nb_neighbors: 20
   outlier_std_ratio: 2.0
 
-  init_overlap_thresh: 0.75
+  init_overlap_thresh: 0.65
   overlap_thresh_factor: 0.025
-  iou_thresh: 0.05
+  iou_thresh: 0.03
   clip_masked_weight: 0.4418
   clip_bbox_margin: 50
   feature_dbscan_eps: 0.01
@@ -91,6 +94,13 @@ pipeline:
   save_intermediate_results: true
   obj_labels: HM3DSEM_LABELS
   merge_objects_graph: false
+
+  # Object-level denoising keeps all supported components (chair legs and
+  # backrests can be disconnected) and filters the resulting mask afterward.
+  object_dbscan_eps_m: 0.07
+  object_dbscan_min_points: 5
+  object_dbscan_min_cluster_points: 8
+  object_dbscan_min_cluster_ratio: 0.02
 
   # Robust single-floor fallback. A detected height peak is preferred as the
   # floor level; these quantiles only reject extreme vertical outliers and

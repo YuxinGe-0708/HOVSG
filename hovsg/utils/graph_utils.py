@@ -377,11 +377,16 @@ def merge_point_clouds_list(pcd_list, voxel_size=0.02):
         :param voxel_size: Voxel size for downsampling.
         :return: Merged point cloud.
     """
-    merged_pcd = pcd_list[0]
-    for pcd in pcd_list[1:]:
+    non_empty = [pcd for pcd in pcd_list if pcd is not None and not pcd.is_empty()]
+    if not non_empty:
+        return o3d.geometry.PointCloud()
+    merged_pcd = o3d.geometry.PointCloud()
+    for pcd in non_empty:
         merged_pcd += pcd
-    merged_pcd = pcd_denoise_dbscan(merged_pcd, eps=0.1, min_points=10)
-    return merged_pcd
+    # Do not discard disconnected but valid parts (for example chair legs or
+    # a separated backrest) while masks from different views are being merged.
+    # Object-level DBSCAN is applied once later, with the configured policy.
+    return merged_pcd.voxel_down_sample(float(voxel_size))
 
 def feats_denoise_dbscan(feats, eps=0.02, min_points=2):
     """
@@ -426,14 +431,30 @@ def feats_denoise_dbscan(feats, eps=0.02, min_points=2):
     return feats
 
 
-def pcd_denoise_dbscan(pcd: o3d.geometry.PointCloud, eps=0.02, min_points=10):
+def pcd_denoise_dbscan(
+    pcd: o3d.geometry.PointCloud,
+    eps=0.02,
+    min_points=10,
+    keep_all_clusters=False,
+    min_cluster_points=5,
+    min_cluster_ratio=0.0,
+):
     """
     Denoise the point cloud using DBSCAN.
     :param pcd: Point cloud to denoise.
     :param eps: Maximum distance between two samples for one to be considered as in the neighborhood of the other.
     :param min_points: The number of samples in a neighborhood for a point to be considered as a core point.
+    :param keep_all_clusters: Keep every sufficiently supported component instead
+        of retaining only the largest component. This is important for objects
+        with disconnected valid parts such as chair legs.
+    :param min_cluster_points: Minimum size of a retained non-noise component
+        when ``keep_all_clusters`` is enabled.
+    :param min_cluster_ratio: Minimum fraction of the input points for a retained
+        component when ``keep_all_clusters`` is enabled.
     :return: Denoised point cloud.
     """
+    if pcd is None or pcd.is_empty():
+        return pcd
     ### Remove noise via clustering
     pcd_clusters = pcd.cluster_dbscan(
         eps=eps,
@@ -453,26 +474,41 @@ def pcd_denoise_dbscan(pcd: o3d.geometry.PointCloud, eps=0.02, min_points=10):
         del counter[-1]
 
     if counter:
-        # Find the label of the largest cluster
-        most_common_label, _ = counter.most_common(1)[0]
+        if keep_all_clusters:
+            input_count = len(obj_points)
+            min_cluster_size = max(
+                int(min_cluster_points),
+                int(np.ceil(float(min_cluster_ratio) * input_count)),
+            )
+            kept_labels = {
+                label
+                for label, count in counter.items()
+                if count >= min_cluster_size
+            }
+            if not kept_labels:
+                return pcd
+            retained_mask = np.isin(pcd_clusters, list(kept_labels))
+        else:
+            # Preserve the historical behavior for callers that explicitly want
+            # a single dominant component.
+            most_common_label, _ = counter.most_common(1)[0]
+            retained_mask = pcd_clusters == most_common_label
 
-        # Create mask for points in the largest cluster
-        largest_mask = pcd_clusters == most_common_label
+        retained_points = obj_points[retained_mask]
+        has_colors = len(obj_colors) == len(obj_points)
+        retained_colors = obj_colors[retained_mask] if has_colors else None
 
-        # Apply mask
-        largest_cluster_points = obj_points[largest_mask]
-        largest_cluster_colors = obj_colors[largest_mask]
-
-        # If the largest cluster is too small, return the original point cloud
-        if len(largest_cluster_points) < 5:
+        # If the retained component(s) are too small, return the original cloud.
+        if len(retained_points) < 5:
             return pcd
 
         # Create a new PointCloud object
-        largest_cluster_pcd = o3d.geometry.PointCloud()
-        largest_cluster_pcd.points = o3d.utility.Vector3dVector(largest_cluster_points)
-        largest_cluster_pcd.colors = o3d.utility.Vector3dVector(largest_cluster_colors)
+        retained_pcd = o3d.geometry.PointCloud()
+        retained_pcd.points = o3d.utility.Vector3dVector(retained_points)
+        if retained_colors is not None:
+            retained_pcd.colors = o3d.utility.Vector3dVector(retained_colors)
 
-        pcd = largest_cluster_pcd
+        pcd = retained_pcd
 
     return pcd
 
