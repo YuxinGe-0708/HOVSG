@@ -277,6 +277,9 @@ class NavigationGraphHandheldTest(unittest.TestCase):
                 pose_region_radius=0.2,
                 pose_center_radius_m=0.05,
                 obstacle_inflation_radius_m=0.0,
+                obstacle_radius_filter_enabled=False,
+                obstacle_min_component_cells=1,
+                trajectory_noise_clearing_enabled=False,
                 max_raw_obstacle_pose_center_overlap_ratio=0.10,
             )
 
