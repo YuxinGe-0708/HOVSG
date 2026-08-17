@@ -170,6 +170,22 @@ navigation:
   obstacle_max_height_m: 1.80
   ceiling_clearance_m: 0.20
   obstacle_min_points_per_cell: 3
+  # Remove isolated 3-D points and tiny flat components before footprint
+  # inflation. Thin vertical structures are retained even when their 2-D
+  # footprint is small.
+  obstacle_radius_filter_enabled: true
+  obstacle_radius_filter_m: 0.10
+  obstacle_radius_min_neighbors: 5
+  obstacle_min_component_cells: 4
+  obstacle_high_confidence_min_points: 8
+  obstacle_high_confidence_min_vertical_span_m: 0.12
+  obstacle_high_confidence_min_component_cells: 20
+  # Handheld camera poses are weak free-space evidence. Clear only weak
+  # obstacle cells in a narrow centerline corridor, before inflation, and fail
+  # if the requested clearing would remove more than 5% of obstacle evidence.
+  trajectory_noise_clearing_enabled: true
+  trajectory_noise_clearing_radius_m: 0.10
+  trajectory_max_carved_obstacle_ratio: 0.05
   # Reject a navigation map when even the narrow center of the recorded path
   # is occupied. Clearing these cells would hide unresolved SLAM ghosting and
   # could remove real obstacles, so real-robot navigation fails closed.

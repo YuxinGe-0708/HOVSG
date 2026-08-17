@@ -102,6 +102,76 @@ class NavigationGraphHandheldTest(unittest.TestCase):
         self.assertEqual(grid[sparse_cell[1], sparse_cell[0]], 0)
         self.assertEqual(grid[dense_cell[1], dense_cell[0]], 1)
 
+    def test_radius_filter_removes_isolated_obstacle_points(self):
+        cluster = np.asarray(
+            [
+                [1.00, 0.50, 1.00],
+                [1.01, 0.50, 1.00],
+                [1.00, 0.51, 1.01],
+                [0.99, 0.50, 1.00],
+                [1.00, 0.49, 0.99],
+                [1.01, 0.51, 1.01],
+            ]
+        )
+        isolated = np.asarray([[3.0, 0.5, 3.0]])
+
+        filtered, stats = self.nav.filter_sparse_obstacle_points(
+            np.vstack((cluster, isolated)),
+            radius_m=0.05,
+            min_neighbors=3,
+        )
+
+        self.assertEqual(len(filtered), len(cluster))
+        self.assertEqual(stats["removed_points"], 1)
+
+    def test_trajectory_clears_only_low_confidence_obstacles(self):
+        points = []
+        for x, z in ((1.01, 1.01), (1.11, 1.01), (1.01, 1.11), (1.11, 1.11)):
+            points.extend([[x, 0.40, z], [x + 0.01, 0.40, z], [x, 0.40, z + 0.01]])
+        points.extend(
+            [
+                [2.01, 0.20, 2.01],
+                [2.01, 0.40, 2.01],
+                [2.01, 0.60, 2.01],
+            ]
+        )
+        points.extend([[3.01, 0.40, 3.01]] * 3)
+        confidence = self.nav.build_obstacle_confidence_maps(
+            np.asarray(points),
+            min_points_per_cell=3,
+            min_component_cells=4,
+            high_confidence_min_points=8,
+            high_confidence_min_vertical_span_m=0.12,
+            high_confidence_min_component_cells=20,
+        )
+        trajectory = np.logical_or(
+            confidence["low_confidence"],
+            confidence["high_confidence"],
+        )
+
+        cleaned, removed, ratio = (
+            self.nav.clear_low_confidence_obstacles_near_trajectory(
+                confidence["retained"],
+                confidence["low_confidence"],
+                trajectory,
+                max_carved_ratio=1.0,
+            )
+        )
+
+        self.assertEqual(int(np.count_nonzero(confidence["low_confidence"])), 4)
+        self.assertEqual(int(np.count_nonzero(confidence["high_confidence"])), 1)
+        self.assertEqual(int(np.count_nonzero(confidence["removed_sparse"])), 1)
+        self.assertEqual(int(np.count_nonzero(removed)), 4)
+        self.assertEqual(int(np.count_nonzero(cleaned)), 1)
+        self.assertAlmostEqual(ratio, 0.8)
+        with self.assertRaisesRegex(RuntimeError, "remove too much"):
+            self.nav.clear_low_confidence_obstacles_near_trajectory(
+                confidence["retained"],
+                confidence["low_confidence"],
+                trajectory,
+                max_carved_ratio=0.1,
+            )
+
     def test_ground_family_excludes_drift_layers_but_keeps_table(self):
         points = np.array(
             [

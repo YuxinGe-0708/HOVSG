@@ -376,6 +376,7 @@ class NavigationGraph:
         floor_pcd: o3d.geometry.PointCloud,
         floor_info: Dict,
         height_region: List[float] = None,
+        return_3d: bool = False,
     ) -> np.ndarray:
         """Get the point cloud within a certain height range from the floor as the obstacles.
 
@@ -456,12 +457,156 @@ class NavigationGraph:
         floor_pcd = floor_pcd[
             ~inside_ground_family & obstacle_height & below_ceiling
         ]
+        if return_3d:
+            return floor_pcd
         # project to 2D
         floor_pcd = floor_pcd[:, [0, 2]]
         # plot for debugging
         # plt.scatter(floor_pcd[:, 0], floor_pcd[:, 1], s=1)
         # plt.show()
         return floor_pcd
+
+    def filter_sparse_obstacle_points(
+        self,
+        obstacle_points: np.ndarray,
+        enabled: bool = True,
+        radius_m: float = 0.10,
+        min_neighbors: int = 5,
+    ) -> Tuple[np.ndarray, Dict]:
+        """Remove isolated 3-D obstacle points before rasterization."""
+        obstacle_points = np.asarray(obstacle_points, dtype=np.float64)
+        input_count = len(obstacle_points)
+        if not enabled or input_count == 0:
+            return obstacle_points, {
+                "input_points": input_count,
+                "retained_points": input_count,
+                "removed_points": 0,
+            }
+        if radius_m <= 0 or min_neighbors < 1:
+            raise ValueError("Obstacle radius filter parameters must be positive")
+        if input_count < min_neighbors:
+            filtered = np.empty((0, 3), dtype=np.float64)
+        else:
+            cloud = o3d.geometry.PointCloud()
+            cloud.points = o3d.utility.Vector3dVector(obstacle_points)
+            _, retained_indices = cloud.remove_radius_outlier(
+                nb_points=int(min_neighbors),
+                radius=float(radius_m),
+            )
+            filtered = obstacle_points[np.asarray(retained_indices, dtype=np.int64)]
+        return filtered, {
+            "input_points": input_count,
+            "retained_points": len(filtered),
+            "removed_points": input_count - len(filtered),
+        }
+
+    def build_obstacle_confidence_maps(
+        self,
+        obstacle_points: np.ndarray,
+        min_points_per_cell: int = 3,
+        min_component_cells: int = 4,
+        high_confidence_min_points: int = 8,
+        high_confidence_min_vertical_span_m: float = 0.12,
+        high_confidence_min_component_cells: int = 20,
+    ) -> Dict:
+        """Rasterize obstacle support and separate robust from weak evidence."""
+        obstacle_points = np.asarray(obstacle_points, dtype=np.float64)
+        shape = tuple(self.grid_size[::-1])
+        counts = np.zeros(shape, dtype=np.int32)
+        min_height = np.full(shape, np.inf, dtype=np.float64)
+        max_height = np.full(shape, -np.inf, dtype=np.float64)
+        if len(obstacle_points):
+            x_cells = np.floor(
+                (obstacle_points[:, 0] - self.pcd_min[0]) / self.cell_size
+            ).astype(np.int64)
+            z_cells = np.floor(
+                (obstacle_points[:, 2] - self.pcd_min[2]) / self.cell_size
+            ).astype(np.int64)
+            valid = (
+                (x_cells >= 0)
+                & (x_cells < shape[1])
+                & (z_cells >= 0)
+                & (z_cells < shape[0])
+                & np.isfinite(obstacle_points).all(axis=1)
+            )
+            rows = z_cells[valid]
+            columns = x_cells[valid]
+            heights = obstacle_points[valid, 1]
+            np.add.at(counts, (rows, columns), 1)
+            np.minimum.at(min_height, (rows, columns), heights)
+            np.maximum.at(max_height, (rows, columns), heights)
+
+        candidate = counts >= max(1, int(min_points_per_cell))
+        vertical_span = np.where(candidate, max_height - min_height, 0.0)
+        labels, component_count = connected_components(
+            candidate,
+            structure=np.ones((3, 3), dtype=np.uint8),
+        )
+        component_sizes = np.bincount(labels.ravel())
+        cell_component_size = component_sizes[labels]
+        vertical_structure = (
+            vertical_span >= float(high_confidence_min_vertical_span_m)
+        )
+        retained = candidate & (
+            (cell_component_size >= max(1, int(min_component_cells)))
+            | vertical_structure
+        )
+        dense_large_structure = (
+            (counts >= max(1, int(high_confidence_min_points)))
+            & (
+                cell_component_size
+                >= max(1, int(high_confidence_min_component_cells))
+            )
+        )
+        high_confidence = retained & (
+            vertical_structure | dense_large_structure
+        )
+        low_confidence = retained & ~high_confidence
+        return {
+            "candidate": candidate.astype(np.uint8),
+            "retained": retained.astype(np.uint8),
+            "high_confidence": high_confidence.astype(np.uint8),
+            "low_confidence": low_confidence.astype(np.uint8),
+            "removed_sparse": (candidate & ~retained).astype(np.uint8),
+            "counts": counts,
+            "vertical_span": vertical_span,
+            "component_count": int(component_count),
+        }
+
+    @staticmethod
+    def clear_low_confidence_obstacles_near_trajectory(
+        retained_map: np.ndarray,
+        low_confidence_map: np.ndarray,
+        trajectory_map: np.ndarray,
+        enabled: bool = True,
+        max_carved_ratio: float = 0.05,
+    ) -> Tuple[np.ndarray, np.ndarray, float]:
+        """Clear only weak obstacle cells contradicted by a trajectory corridor."""
+        retained = np.asarray(retained_map, dtype=bool)
+        low_confidence = np.asarray(low_confidence_map, dtype=bool)
+        trajectory = np.asarray(trajectory_map, dtype=bool)
+        if not (
+            retained.shape == low_confidence.shape == trajectory.shape
+        ):
+            raise ValueError("Obstacle and trajectory maps must have equal shapes")
+        if not 0.0 <= max_carved_ratio <= 1.0:
+            raise ValueError("max_carved_ratio must be in [0, 1]")
+        removed = (
+            low_confidence & trajectory
+            if enabled
+            else np.zeros_like(retained, dtype=bool)
+        )
+        carved_ratio = float(
+            np.count_nonzero(removed) / max(np.count_nonzero(retained), 1)
+        )
+        if carved_ratio > max_carved_ratio:
+            raise RuntimeError(
+                "Trajectory noise clearing would remove too much obstacle "
+                f"evidence: {carved_ratio:.1%} > {max_carved_ratio:.1%}. "
+                "Inspect floor_obstacles_low_confidence.png and "
+                "trajectory_noise_clearance_map.png instead of forcing a route."
+            )
+        return (retained & ~removed).astype(np.uint8), removed, carved_ratio
 
     def floor_region_vertices(
         self,
@@ -813,6 +958,16 @@ class NavigationGraph:
         local_ground_min_component_area_m2: float = 5.0,
         local_ground_envelope_margin_m: float = 0.20,
         local_ground_support_radius_cells: int = 1,
+        obstacle_radius_filter_enabled: bool = True,
+        obstacle_radius_filter_m: float = 0.10,
+        obstacle_radius_min_neighbors: int = 5,
+        obstacle_min_component_cells: int = 4,
+        obstacle_high_confidence_min_points: int = 8,
+        obstacle_high_confidence_min_vertical_span_m: float = 0.12,
+        obstacle_high_confidence_min_component_cells: int = 20,
+        trajectory_noise_clearing_enabled: bool = True,
+        trajectory_noise_clearing_radius_m: float = 0.10,
+        trajectory_max_carved_obstacle_ratio: float = 0.05,
     ) -> np.ndarray:
         """Get the free region of the floor as a grid map.
 
@@ -853,10 +1008,29 @@ class NavigationGraph:
             )
             if local_ground_model["retained_components"] > 0:
                 floor_info["_local_ground_model"] = local_ground_model
-        obstaces_vertices = self.obstacles_vertices(
+        obstacle_points = self.obstacles_vertices(
             floor_pcd,
             floor_info,
             height_region=[obstacle_min_height_m, obstacle_max_height_m],
+            return_3d=True,
+        )
+        obstacle_points, radius_filter_stats = self.filter_sparse_obstacle_points(
+            obstacle_points,
+            enabled=obstacle_radius_filter_enabled,
+            radius_m=obstacle_radius_filter_m,
+            min_neighbors=obstacle_radius_min_neighbors,
+        )
+        obstacle_confidence = self.build_obstacle_confidence_maps(
+            obstacle_points,
+            min_points_per_cell=obstacle_min_points_per_cell,
+            min_component_cells=obstacle_min_component_cells,
+            high_confidence_min_points=obstacle_high_confidence_min_points,
+            high_confidence_min_vertical_span_m=(
+                obstacle_high_confidence_min_vertical_span_m
+            ),
+            high_confidence_min_component_cells=(
+                obstacle_high_confidence_min_component_cells
+            ),
         )
         floor_region_vertices = self.floor_region_vertices(
             floor_pcd,
@@ -905,17 +1079,31 @@ class NavigationGraph:
         )
         if inflation_diameter_cells % 2 == 0:
             inflation_diameter_cells += 1
-        raw_obstacle_map = self.create_occupancy_grid(
-            obstaces_vertices,
-            dilation_radius=0,
-            filter_size=0,
-            min_points_per_cell=obstacle_min_points_per_cell,
-        )
         pose_center_map = self.get_poses_region(
             floor_poses_list,
             radius=pose_center_radius_m,
             save=False,
             cluster=cluster_pose_heights,
+        )
+        trajectory_clearance_map = self.get_poses_region(
+            floor_poses_list,
+            radius=trajectory_noise_clearing_radius_m,
+            save=False,
+            cluster=cluster_pose_heights,
+        )
+        obstacle_before_trajectory = obstacle_confidence["retained"].astype(bool)
+        raw_obstacle_map, trajectory_removed, trajectory_carved_ratio = (
+            self.clear_low_confidence_obstacles_near_trajectory(
+                obstacle_before_trajectory,
+                obstacle_confidence["low_confidence"],
+                trajectory_clearance_map,
+                enabled=trajectory_noise_clearing_enabled,
+                max_carved_ratio=trajectory_max_carved_obstacle_ratio,
+            )
+        )
+        trajectory_removed_cells = int(np.count_nonzero(trajectory_removed))
+        obstacle_before_trajectory_cells = int(
+            np.count_nonzero(obstacle_before_trajectory)
         )
         pose_center_cells = int(np.count_nonzero(pose_center_map))
         raw_obstacle_pose_center_overlap_cells = int(
@@ -926,11 +1114,14 @@ class NavigationGraph:
         raw_obstacle_pose_center_overlap_ratio = float(
             raw_obstacle_pose_center_overlap_cells / max(pose_center_cells, 1)
         )
-        self.map = self.create_occupancy_grid(
-            obstaces_vertices,
-            dilation_radius=inflation_diameter_cells,
-            filter_size=0,
-            min_points_per_cell=obstacle_min_points_per_cell,
+        inflation_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (inflation_diameter_cells, inflation_diameter_cells),
+        )
+        self.map = cv2.dilate(
+            raw_obstacle_map,
+            inflation_kernel,
+            iterations=1,
         )
         floor_free_map = (
             floor_occupancy_map.astype(np.int16) - self.map.astype(np.int16)
@@ -949,6 +1140,30 @@ class NavigationGraph:
             pose_region_cells=int(np.count_nonzero(poses_map)),
             obstacle_cells=int(np.count_nonzero(self.map)),
             raw_obstacle_cells=int(np.count_nonzero(raw_obstacle_map)),
+            obstacle_candidate_cells=int(
+                np.count_nonzero(obstacle_confidence["candidate"])
+            ),
+            obstacle_sparse_removed_cells=int(
+                np.count_nonzero(obstacle_confidence["removed_sparse"])
+            ),
+            obstacle_high_confidence_cells=int(
+                np.count_nonzero(obstacle_confidence["high_confidence"])
+            ),
+            obstacle_low_confidence_cells=int(
+                np.count_nonzero(obstacle_confidence["low_confidence"])
+            ),
+            obstacle_radius_input_points=radius_filter_stats["input_points"],
+            obstacle_radius_retained_points=radius_filter_stats[
+                "retained_points"
+            ],
+            obstacle_radius_removed_points=radius_filter_stats["removed_points"],
+            obstacle_temporal_support_available=False,
+            trajectory_noise_clearing_enabled=trajectory_noise_clearing_enabled,
+            trajectory_removed_cells=trajectory_removed_cells,
+            trajectory_carved_ratio=trajectory_carved_ratio,
+            trajectory_max_carved_obstacle_ratio=float(
+                trajectory_max_carved_obstacle_ratio
+            ),
             free_cells=int(np.count_nonzero(floor_free_map)),
             main_free_cells=int(np.count_nonzero(main_free_map)),
             obstacle_min_points_per_cell=int(obstacle_min_points_per_cell),
@@ -966,6 +1181,30 @@ class NavigationGraph:
             ),
         )
         if save:
+            cv2.imwrite(
+                os.path.join(floor_dir, "floor_obstacles_candidate.png"),
+                obstacle_confidence["candidate"] * 255,
+            )
+            cv2.imwrite(
+                os.path.join(floor_dir, "floor_obstacles_sparse_removed.png"),
+                obstacle_confidence["removed_sparse"] * 255,
+            )
+            cv2.imwrite(
+                os.path.join(floor_dir, "floor_obstacles_high_confidence.png"),
+                obstacle_confidence["high_confidence"] * 255,
+            )
+            cv2.imwrite(
+                os.path.join(floor_dir, "floor_obstacles_low_confidence.png"),
+                obstacle_confidence["low_confidence"] * 255,
+            )
+            cv2.imwrite(
+                os.path.join(floor_dir, "trajectory_noise_clearance_map.png"),
+                trajectory_clearance_map.astype(np.uint8) * 255,
+            )
+            cv2.imwrite(
+                os.path.join(floor_dir, "floor_obstacles_trajectory_removed.png"),
+                trajectory_removed.astype(np.uint8) * 255,
+            )
             cv2.imwrite(
                 os.path.join(floor_dir, "floor_obstacles_raw.png"),
                 raw_obstacle_map.astype(np.uint8) * 255,
@@ -1812,6 +2051,46 @@ class NavigationGraph:
             ),
             local_ground_support_radius_cells=int(
                 navigation_config.get("local_ground_support_radius_cells", 1)
+            ),
+            obstacle_radius_filter_enabled=bool(
+                navigation_config.get("obstacle_radius_filter_enabled", True)
+            ),
+            obstacle_radius_filter_m=float(
+                navigation_config.get("obstacle_radius_filter_m", 0.10)
+            ),
+            obstacle_radius_min_neighbors=int(
+                navigation_config.get("obstacle_radius_min_neighbors", 5)
+            ),
+            obstacle_min_component_cells=int(
+                navigation_config.get("obstacle_min_component_cells", 4)
+            ),
+            obstacle_high_confidence_min_points=int(
+                navigation_config.get("obstacle_high_confidence_min_points", 8)
+            ),
+            obstacle_high_confidence_min_vertical_span_m=float(
+                navigation_config.get(
+                    "obstacle_high_confidence_min_vertical_span_m", 0.12
+                )
+            ),
+            obstacle_high_confidence_min_component_cells=int(
+                navigation_config.get(
+                    "obstacle_high_confidence_min_component_cells", 20
+                )
+            ),
+            trajectory_noise_clearing_enabled=bool(
+                navigation_config.get(
+                    "trajectory_noise_clearing_enabled", True
+                )
+            ),
+            trajectory_noise_clearing_radius_m=float(
+                navigation_config.get(
+                    "trajectory_noise_clearing_radius_m", 0.10
+                )
+            ),
+            trajectory_max_carved_obstacle_ratio=float(
+                navigation_config.get(
+                    "trajectory_max_carved_obstacle_ratio", 0.05
+                )
             ),
         ).astype(np.uint8)
         minimum_navigable_area_m2 = float(
