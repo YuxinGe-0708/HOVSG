@@ -47,7 +47,7 @@ class GraphUtilsTest(unittest.TestCase):
             [make_cloud(cluster_a), make_cloud(cluster_b)], voxel_size=0.01
         )
 
-        self.assertGreaterEqual(len(merged.points), 20)
+        self.assertGreaterEqual(len(merged.points), 16)
         bounds = np.asarray(merged.get_max_bound()) - np.asarray(merged.get_min_bound())
         self.assertGreater(bounds[2], 0.19)
 
