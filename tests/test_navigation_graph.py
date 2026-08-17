@@ -131,6 +131,45 @@ class NavigationGraphHandheldTest(unittest.TestCase):
         self.assertEqual(len(obstacles), 2)
         np.testing.assert_allclose(obstacles, [[2.5, 2.5], [2.7, 2.7]])
 
+    def test_local_ground_model_follows_continuous_floor_drift(self):
+        floor_points = []
+        for x in np.linspace(0.0, 4.0, 41):
+            for z in np.linspace(0.0, 4.0, 41):
+                floor_points.append([x, 0.10 * x, z])
+        obstacle_points = np.repeat([[2.0, 0.70, 2.0]], 5, axis=0)
+        points = np.vstack((np.asarray(floor_points), obstacle_points))
+        cloud = o3d.geometry.PointCloud()
+        cloud.points = o3d.utility.Vector3dVector(points)
+        nav = NavigationGraph(cloud, cell_size=0.1)
+        info = {
+            "floor_zero_level": 0.0,
+            "floor_height": 3.0,
+            "ground_height_family": [0.0, 0.40],
+            "ground_family_exclusion_below_m": 0.10,
+            "ground_family_exclusion_above_m": 0.15,
+        }
+
+        model = nav.build_local_ground_model(
+            cloud,
+            info,
+            cell_size_m=0.10,
+            height_bin_m=0.04,
+            normal_radius_m=0.25,
+            min_points_per_voxel=1,
+            min_component_area_m2=5.0,
+            envelope_margin_m=0.10,
+        )
+        info["_local_ground_model"] = model
+        ground = nav.floor_region_vertices(cloud, info)
+        obstacles = nav.obstacles_vertices(cloud, info)
+
+        floor_ground_ratio = np.mean(model["ground_mask"][: len(floor_points)])
+        self.assertGreater(floor_ground_ratio, 0.95)
+        self.assertGreaterEqual(model["retained_components"], 1)
+        self.assertGreater(len(ground), int(0.95 * len(floor_points)))
+        self.assertEqual(len(obstacles), len(obstacle_points))
+        np.testing.assert_allclose(obstacles, np.repeat([[2.0, 2.0]], 5, axis=0))
+
     def test_floor_round_trip_preserves_ground_height_family(self):
         self.floor.vertices = np.asarray(
             self.floor.pcd.get_axis_aligned_bounding_box().get_box_points()

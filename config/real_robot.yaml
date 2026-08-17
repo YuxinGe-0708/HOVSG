@@ -144,6 +144,19 @@ robot:
 
 navigation:
   cell_size_m: 0.05
+  # Reconstruct locally supported ground surfaces in X-Z-height space. This
+  # bridges continuous SLAM floor drift between global height peaks while
+  # keeping small horizontal objects and vertical structures as obstacles.
+  local_ground_enabled: true
+  local_ground_cell_m: 0.10
+  local_ground_height_bin_m: 0.04
+  local_ground_normal_radius_m: 0.15
+  local_ground_normal_max_nn: 50
+  local_ground_normal_max_tilt_deg: 20.0
+  local_ground_min_points_per_voxel: 2
+  local_ground_min_component_area_m2: 5.0
+  local_ground_envelope_margin_m: 0.20
+  local_ground_support_radius_cells: 1
   # Mark a 0.5 m neighborhood around every valid horizontal camera position.
   pose_region_radius_m: 0.50
   # Only a narrow band around the fitted ground is used as floor evidence.

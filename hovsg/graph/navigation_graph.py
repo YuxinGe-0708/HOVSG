@@ -16,7 +16,13 @@ from networkx.readwrite import json_graph
 import numpy as np
 import open3d as o3d
 import pyvista as pv
-from scipy.ndimage import binary_closing, binary_dilation, binary_erosion, median_filter
+from scipy.ndimage import (
+    binary_closing,
+    binary_dilation,
+    binary_erosion,
+    label as connected_components,
+    median_filter,
+)
 from scipy.signal import find_peaks
 from scipy.spatial import Delaunay, Voronoi, voronoi_plot_2d
 from scipy.spatial.distance import cdist
@@ -142,6 +148,229 @@ class NavigationGraph:
         """
         return grid_coords * self.cell_size + self.pcd_min
 
+    def build_local_ground_model(
+        self,
+        floor_pcd: o3d.geometry.PointCloud,
+        floor_info: Dict,
+        cell_size_m: float = 0.10,
+        height_bin_m: float = 0.04,
+        normal_radius_m: float = 0.15,
+        normal_max_nn: int = 50,
+        normal_max_tilt_deg: float = 20.0,
+        min_points_per_voxel: int = 2,
+        min_component_area_m2: float = 5.0,
+        envelope_margin_m: float = 0.20,
+        support_radius_cells: int = 1,
+        ground_below_m: float = 0.10,
+        ground_above_m: float = 0.15,
+    ) -> Dict:
+        """Build locally supported ground surfaces from horizontal point clusters.
+
+        The global ground-height family is only used to define a conservative
+        vertical search envelope. Within that envelope, large connected
+        horizontal surfaces are retained in an X-Z-height voxel grid. This
+        fills continuous SLAM floor drift without deleting every object whose
+        absolute height lies between two drifted floor peaks.
+        """
+        points = np.asarray(floor_pcd.points, dtype=np.float64)
+        if points.size == 0:
+            raise RuntimeError("Cannot build a local ground model from no points")
+        if cell_size_m <= 0 or height_bin_m <= 0:
+            raise ValueError("Local-ground cell and height-bin sizes must be positive")
+
+        floor_zero_level = float(floor_info["floor_zero_level"])
+        ground_family = np.asarray(
+            floor_info.get("ground_height_family") or [floor_zero_level],
+            dtype=np.float64,
+        )
+        ground_family = ground_family[np.isfinite(ground_family)]
+        if ground_family.size == 0:
+            ground_family = np.asarray([floor_zero_level], dtype=np.float64)
+
+        cloud_with_normals = copy.deepcopy(floor_pcd)
+        cloud_with_normals.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(
+                radius=float(normal_radius_m),
+                max_nn=max(3, int(normal_max_nn)),
+            )
+        )
+        normals = np.asarray(cloud_with_normals.normals, dtype=np.float64)
+        horizontal = np.abs(normals[:, 1]) >= np.cos(
+            np.deg2rad(float(normal_max_tilt_deg))
+        )
+
+        height_min = float(np.min(ground_family) - envelope_margin_m)
+        height_max = float(np.max(ground_family) + envelope_margin_m)
+        candidate_mask = (
+            np.isfinite(points).all(axis=1)
+            & np.isfinite(normals).all(axis=1)
+            & horizontal
+            & (points[:, 1] >= height_min)
+            & (points[:, 1] <= height_max)
+        )
+
+        x_size = max(
+            1,
+            int(np.ceil((self.pcd_max[0] - self.pcd_min[0]) / cell_size_m)) + 1,
+        )
+        z_size = max(
+            1,
+            int(np.ceil((self.pcd_max[2] - self.pcd_min[2]) / cell_size_m)) + 1,
+        )
+        height_size = max(
+            1,
+            int(np.ceil((height_max - height_min) / height_bin_m)) + 1,
+        )
+        volume_shape = (height_size, z_size, x_size)
+        candidate_indices = np.flatnonzero(candidate_mask)
+        candidate_points = points[candidate_indices]
+        x_index = np.floor(
+            (candidate_points[:, 0] - self.pcd_min[0]) / cell_size_m
+        ).astype(np.int64)
+        z_index = np.floor(
+            (candidate_points[:, 2] - self.pcd_min[2]) / cell_size_m
+        ).astype(np.int64)
+        height_index = np.floor(
+            (candidate_points[:, 1] - height_min) / height_bin_m
+        ).astype(np.int64)
+        valid = (
+            (x_index >= 0)
+            & (x_index < x_size)
+            & (z_index >= 0)
+            & (z_index < z_size)
+            & (height_index >= 0)
+            & (height_index < height_size)
+        )
+        flat_index = np.ravel_multi_index(
+            (height_index[valid], z_index[valid], x_index[valid]),
+            volume_shape,
+        )
+        voxel_counts = np.bincount(
+            flat_index,
+            minlength=int(np.prod(volume_shape)),
+        ).reshape(volume_shape)
+        occupied = voxel_counts >= max(1, int(min_points_per_voxel))
+
+        labels, component_count = connected_components(
+            occupied,
+            structure=np.ones((3, 3, 3), dtype=np.uint8),
+        )
+        minimum_cells = max(
+            1,
+            int(np.ceil(min_component_area_m2 / (cell_size_m**2))),
+        )
+        retained_labels = []
+        retained_areas = []
+        for component_id in range(1, int(component_count) + 1):
+            component_voxels = np.argwhere(labels == component_id)
+            if component_voxels.size == 0:
+                continue
+            xz_cells = np.unique(component_voxels[:, [1, 2]], axis=0)
+            if len(xz_cells) < minimum_cells:
+                continue
+            retained_labels.append(component_id)
+            retained_areas.append(float(len(xz_cells) * cell_size_m**2))
+
+        if retained_labels:
+            retained = np.isin(labels, retained_labels)
+        else:
+            retained = np.zeros(volume_shape, dtype=bool)
+
+        spatial_radius = max(0, int(support_radius_cells))
+        if spatial_radius > 0 and np.any(retained):
+            local_support = binary_dilation(
+                retained,
+                structure=np.ones(
+                    (1, 2 * spatial_radius + 1, 2 * spatial_radius + 1),
+                    dtype=bool,
+                ),
+            )
+        else:
+            local_support = retained
+
+        vertical_radius = max(
+            1,
+            int(np.ceil(max(ground_below_m, ground_above_m) / height_bin_m)),
+        )
+        expanded_ground = binary_dilation(
+            local_support,
+            structure=np.ones(
+                (2 * vertical_radius + 1, 1, 1),
+                dtype=bool,
+            ),
+        )
+
+        all_x = np.floor((points[:, 0] - self.pcd_min[0]) / cell_size_m).astype(
+            np.int64
+        )
+        all_z = np.floor((points[:, 2] - self.pcd_min[2]) / cell_size_m).astype(
+            np.int64
+        )
+        all_h = np.floor((points[:, 1] - height_min) / height_bin_m).astype(
+            np.int64
+        )
+        inside_volume = (
+            (all_x >= 0)
+            & (all_x < x_size)
+            & (all_z >= 0)
+            & (all_z < z_size)
+            & (all_h >= 0)
+            & (all_h < height_size)
+        )
+        local_ground_mask = np.zeros(len(points), dtype=bool)
+        local_ground_mask[inside_volume] = expanded_ground[
+            all_h[inside_volume],
+            all_z[inside_volume],
+            all_x[inside_volume],
+        ]
+
+        support_bins = np.where(
+            local_support,
+            np.arange(height_size, dtype=np.int32)[:, None, None],
+            -1,
+        )
+        highest_support_below = np.maximum.accumulate(support_bins, axis=0)
+        lookup_h = np.clip(all_h, 0, height_size - 1)
+        local_base_bin = np.full(len(points), -1, dtype=np.int32)
+        valid_xz = (
+            (all_x >= 0)
+            & (all_x < x_size)
+            & (all_z >= 0)
+            & (all_z < z_size)
+        )
+        local_base_bin[valid_xz] = highest_support_below[
+            lookup_h[valid_xz],
+            all_z[valid_xz],
+            all_x[valid_xz],
+        ]
+        local_base_height = np.full(len(points), np.nan, dtype=np.float64)
+        has_local_base = local_base_bin >= 0
+        local_base_height[has_local_base] = (
+            height_min + (local_base_bin[has_local_base] + 0.5) * height_bin_m
+        )
+
+        print_status(
+            "LOCAL_GROUND_MODEL",
+            "OK" if retained_labels else "WARN",
+            candidate_points=int(np.count_nonzero(candidate_mask)),
+            occupied_voxels=int(np.count_nonzero(occupied)),
+            components=int(component_count),
+            retained_components=len(retained_labels),
+            retained_areas_m2=[round(area, 3) for area in retained_areas],
+            locally_supported_points=int(np.count_nonzero(local_ground_mask)),
+            points_with_local_base=int(np.count_nonzero(has_local_base)),
+            height_envelope_m=[round(height_min, 4), round(height_max, 4)],
+            cell_size_m=float(cell_size_m),
+            height_bin_m=float(height_bin_m),
+        )
+        return {
+            "ground_mask": local_ground_mask,
+            "base_height": local_base_height,
+            "has_local_base": has_local_base,
+            "retained_components": len(retained_labels),
+            "retained_areas_m2": retained_areas,
+        }
+
     def obstacles_vertices(
         self,
         floor_pcd: o3d.geometry.PointCloud,
@@ -199,6 +428,26 @@ class NavigationGraph:
             relative_heights >= 0.0, relative_heights, np.inf
         )
         obstacle_relative_height = np.min(relative_to_layer_below, axis=1)
+        local_ground_model = floor_info.get("_local_ground_model")
+        if local_ground_model is not None:
+            local_ground_mask = np.asarray(
+                local_ground_model["ground_mask"], dtype=bool
+            )
+            local_base_height = np.asarray(
+                local_ground_model["base_height"], dtype=np.float64
+            )
+            has_local_base = np.asarray(
+                local_ground_model["has_local_base"], dtype=bool
+            )
+            if len(local_ground_mask) != len(floor_pcd):
+                raise RuntimeError("Local-ground model does not match point cloud")
+            inside_ground_family = np.logical_or(
+                inside_ground_family,
+                local_ground_mask,
+            )
+            obstacle_relative_height[has_local_base] = (
+                floor_pcd[has_local_base, 1] - local_base_height[has_local_base]
+            )
         obstacle_height = np.logical_and(
             obstacle_relative_height >= float(height_region[0]),
             obstacle_relative_height <= float(height_region[1]),
@@ -252,6 +501,14 @@ class NavigationGraph:
             ),
             axis=1,
         )
+        local_ground_model = floor_info.get("_local_ground_model")
+        if local_ground_model is not None:
+            local_ground_mask = np.asarray(
+                local_ground_model["ground_mask"], dtype=bool
+            )
+            if len(local_ground_mask) != len(floor_pcd):
+                raise RuntimeError("Local-ground model does not match point cloud")
+            ground_evidence = np.logical_or(ground_evidence, local_ground_mask)
         floor_pcd = floor_pcd[ground_evidence]
         floor_pcd = floor_pcd[:, [0, 2]]
         return floor_pcd
@@ -546,6 +803,16 @@ class NavigationGraph:
         obstacle_inflation_radius_m: float = 0.38,
         pose_center_radius_m: float = 0.15,
         max_raw_obstacle_pose_center_overlap_ratio: float = 0.15,
+        local_ground_enabled: bool = True,
+        local_ground_cell_m: float = 0.10,
+        local_ground_height_bin_m: float = 0.04,
+        local_ground_normal_radius_m: float = 0.15,
+        local_ground_normal_max_nn: int = 50,
+        local_ground_normal_max_tilt_deg: float = 20.0,
+        local_ground_min_points_per_voxel: int = 2,
+        local_ground_min_component_area_m2: float = 5.0,
+        local_ground_envelope_margin_m: float = 0.20,
+        local_ground_support_radius_cells: int = 1,
     ) -> np.ndarray:
         """Get the free region of the floor as a grid map.
 
@@ -567,6 +834,25 @@ class NavigationGraph:
         floor_info["ground_family_exclusion_above_m"] = (
             ground_family_exclusion_above_m
         )
+        local_ground_model = None
+        if local_ground_enabled:
+            local_ground_model = self.build_local_ground_model(
+                floor_pcd,
+                floor_info,
+                cell_size_m=local_ground_cell_m,
+                height_bin_m=local_ground_height_bin_m,
+                normal_radius_m=local_ground_normal_radius_m,
+                normal_max_nn=local_ground_normal_max_nn,
+                normal_max_tilt_deg=local_ground_normal_max_tilt_deg,
+                min_points_per_voxel=local_ground_min_points_per_voxel,
+                min_component_area_m2=local_ground_min_component_area_m2,
+                envelope_margin_m=local_ground_envelope_margin_m,
+                support_radius_cells=local_ground_support_radius_cells,
+                ground_below_m=ground_family_exclusion_below_m,
+                ground_above_m=ground_family_exclusion_above_m,
+            )
+            if local_ground_model["retained_components"] > 0:
+                floor_info["_local_ground_model"] = local_ground_model
         obstaces_vertices = self.obstacles_vertices(
             floor_pcd,
             floor_info,
@@ -589,6 +875,21 @@ class NavigationGraph:
                 os.path.join(floor_dir, "floor_region_no_closing.png"),
                 floor_occupancy_map.astype(np.uint8) * 255,
             )
+            if local_ground_model is not None:
+                points = np.asarray(floor_pcd.points)
+                local_vertices = points[
+                    np.asarray(local_ground_model["ground_mask"], dtype=bool)
+                ][:, [0, 2]]
+                local_ground_map = self.create_occupancy_grid(
+                    local_vertices,
+                    dilation_radius=1,
+                    filter_size=0,
+                    min_points_per_cell=1,
+                )
+                cv2.imwrite(
+                    os.path.join(floor_dir, "local_ground_region.png"),
+                    local_ground_map.astype(np.uint8) * 255,
+                )
         # floor_occupancy_map = binary_closing(floor_occupancy_map, iterations=5)
         poses_map = self.get_poses_region(
             floor_poses_list,
@@ -1481,6 +1782,36 @@ class NavigationGraph:
                 navigation_config.get(
                     "max_raw_obstacle_pose_center_overlap_ratio", 0.15
                 )
+            ),
+            local_ground_enabled=bool(
+                navigation_config.get("local_ground_enabled", True)
+            ),
+            local_ground_cell_m=float(
+                navigation_config.get("local_ground_cell_m", 0.10)
+            ),
+            local_ground_height_bin_m=float(
+                navigation_config.get("local_ground_height_bin_m", 0.04)
+            ),
+            local_ground_normal_radius_m=float(
+                navigation_config.get("local_ground_normal_radius_m", 0.15)
+            ),
+            local_ground_normal_max_nn=int(
+                navigation_config.get("local_ground_normal_max_nn", 50)
+            ),
+            local_ground_normal_max_tilt_deg=float(
+                navigation_config.get("local_ground_normal_max_tilt_deg", 20.0)
+            ),
+            local_ground_min_points_per_voxel=int(
+                navigation_config.get("local_ground_min_points_per_voxel", 2)
+            ),
+            local_ground_min_component_area_m2=float(
+                navigation_config.get("local_ground_min_component_area_m2", 5.0)
+            ),
+            local_ground_envelope_margin_m=float(
+                navigation_config.get("local_ground_envelope_margin_m", 0.20)
+            ),
+            local_ground_support_radius_cells=int(
+                navigation_config.get("local_ground_support_radius_cells", 1)
             ),
         ).astype(np.uint8)
         minimum_navigable_area_m2 = float(
