@@ -104,7 +104,10 @@ pipeline:
   max_mask_distance: 5.0
   depth_weighting: false
   grid_resolution: 0.05
-  merge_type: sequential
+  # Hierarchical merging scales to hundreds of semantic keyframes. Sequential
+  # merging repeatedly compares the growing global mask set and becomes
+  # prohibitively slow for this 642-keyframe handheld recording.
+  merge_type: hierarchical
   save_intermediate_results: true
   obj_labels: HM3DSEM_LABELS
   merge_objects_graph: false
