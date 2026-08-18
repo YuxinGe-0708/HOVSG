@@ -3,7 +3,11 @@ import unittest
 import numpy as np
 import open3d as o3d
 
-from hovsg.utils.graph_utils import merge_point_clouds_list, pcd_denoise_dbscan
+from hovsg.utils.graph_utils import (
+    compute_3d_bbox_iou,
+    merge_point_clouds_list,
+    pcd_denoise_dbscan,
+)
 
 
 def make_cloud(points):
@@ -50,6 +54,13 @@ class GraphUtilsTest(unittest.TestCase):
         self.assertGreaterEqual(len(merged.points), 16)
         bounds = np.asarray(merged.get_max_bound()) - np.asarray(merged.get_min_bound())
         self.assertGreater(bounds[2], 0.19)
+
+    def test_zero_volume_bbox_has_zero_iou(self):
+        line = make_cloud([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+        volume = make_cloud(
+            [[x, y, z] for x in (0.0, 1.0) for y in (0.0, 1.0) for z in (0.0, 1.0)]
+        )
+        self.assertEqual(compute_3d_bbox_iou(line, volume), 0.0)
 
 
 if __name__ == "__main__":

@@ -538,6 +538,17 @@ def compute_3d_bbox_iou(bbox1, bbox2, padding=0):
     bbox1_volume = np.prod(bbox1_max - bbox1_min)
     bbox2_volume = np.prod(bbox2_max - bbox2_min)
 
+    # A non-empty mask can still collapse to a line or a single voxel after
+    # projection/downsampling. Such a zero-volume box cannot overlap another
+    # 3D volume, and treating its IoU as zero avoids invalid divide warnings.
+    if (
+        not np.isfinite(bbox1_volume)
+        or not np.isfinite(bbox2_volume)
+        or bbox1_volume <= 1e-12
+        or bbox2_volume <= 1e-12
+    ):
+        return 0.0
+
     obj_1_overlap = overlap_volume / bbox1_volume
     obj_2_overlap = overlap_volume / bbox2_volume
     max_overlap = max(obj_1_overlap, obj_2_overlap)
