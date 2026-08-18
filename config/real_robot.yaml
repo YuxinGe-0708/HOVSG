@@ -70,6 +70,20 @@ pipeline:
   # Downsample the accumulated point cloud every N accepted keyframes.
   pointcloud_fusion_batch_size: 10
   log_every_n_frames: 1 # print progress every n frames
+  # Save validated geometry before SAM/CLIP starts. A failed semantic run can
+  # restart from this cache without fusing all RGB-D frames again. The cache
+  # is ignored automatically when any geometry input or parameter changes.
+  geometry_cache_enabled: true
+  resume_geometry_cache: true
+  # A 3.7M x 1024 float32 point-feature matrix is about 14.2 GiB. Accumulate
+  # in float16 and use bounded float32 chunks for association and final
+  # normalization. Full point features are discarded after object features
+  # are fused because graph/navigation resume only needs mask_feats.pt.
+  feature_accumulator_dtype: float16
+  feature_association_chunk_points: 32768
+  feature_normalization_chunk_points: 32768
+  semantic_cleanup_interval: 1
+  retain_full_point_features: false
   # Final object masks below this size are not reliable navigation targets.
   min_pcd_points: 100
 

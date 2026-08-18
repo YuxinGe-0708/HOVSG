@@ -5,6 +5,7 @@
 import os
 import json
 import copy
+import gc
 from typing import Any, Dict, List, Set, Tuple, Union
 from pathlib import Path
 
@@ -58,6 +59,11 @@ from hovsg.utils.label_feats import get_label_feats
 from hovsg.utils.constants import MATTERPORT_GT_LABELS, CLIP_DIM
 from hovsg.utils.runtime_status import print_status
 from hovsg.utils.floor_estimation import estimate_single_floor_geometry
+from hovsg.utils.feature_map_memory import (
+    LowMemoryFeatureAccumulator,
+    load_geometry_cache,
+    save_geometry_cache,
+)
 from hovsg.utils.llm_utils import (
     parse_floor_room_object_gpt35,
     parse_hier_query,
@@ -239,6 +245,482 @@ class Graph:
         rotation_deg = np.degrees(np.arccos(cosine))
         return float(translation_m), float(rotation_deg)
 
+    def _geometry_cache_dir(self, save_path=None):
+        """Return the per-run geometry cache directory."""
+        output_root = save_path or self.cfg.main.get("save_path")
+        if not output_root:
+            return None
+        return os.path.join(str(output_root), "geometry_cache")
+
+    def _geometry_cache_signature(
+        self,
+        geometry_skip_frames,
+        voxel_size,
+        fusion_batch_size,
+        keyframe_translation_m,
+        keyframe_rotation_deg,
+        max_pose_translation_jump_m,
+        max_pose_rotation_jump_deg,
+        outlier_nb_neighbors,
+        outlier_std_ratio,
+    ):
+        """Describe every input that changes the fused geometry."""
+        return {
+            "version": 1,
+            "dataset_path": os.path.realpath(str(self.cfg.main.dataset_path)),
+            "dataset_frames": int(len(self.dataset)),
+            "geometry_skip_frames": int(geometry_skip_frames),
+            "voxel_size": float(voxel_size),
+            "fusion_batch_size": int(fusion_batch_size),
+            "keyframe_translation_m": float(keyframe_translation_m),
+            "keyframe_rotation_deg": float(keyframe_rotation_deg),
+            "max_pose_translation_jump_m": float(max_pose_translation_jump_m),
+            "max_pose_rotation_jump_deg": float(max_pose_rotation_jump_deg),
+            "outlier_nb_neighbors": int(outlier_nb_neighbors),
+            "outlier_std_ratio": float(outlier_std_ratio),
+            "pose_mode": str(self.cfg.pipeline.get("pose_mode", "raw")),
+            "min_depth_m": float(self.cfg.pipeline.get("min_depth_m", 0.0)),
+            "max_depth_m": float(self.cfg.pipeline.get("max_depth_m", np.inf)),
+        }
+
+    def _load_cached_geometry(
+        self,
+        cache_dir,
+        signature,
+        semantic_skip_frames,
+    ):
+        """Restore validated geometry and recompute the semantic subset."""
+        cached = load_geometry_cache(cache_dir, signature)
+        if cached is None:
+            return False
+        point_cloud, metadata = cached
+        frame_indices = [int(index) for index in metadata.get("frame_indices", [])]
+        if not frame_indices or any(
+            index < 0 or index >= len(self.dataset) for index in frame_indices
+        ):
+            print_status(
+                "GEOMETRY_CACHE",
+                "WARN",
+                path=cache_dir,
+                reason="invalid_cached_frame_indices",
+            )
+            return False
+
+        self.full_pcd = point_cloud
+        self.frame_indices = frame_indices
+        self.semantic_frame_indices = self.frame_indices[::semantic_skip_frames]
+        if self.semantic_frame_indices[-1] != self.frame_indices[-1]:
+            self.semantic_frame_indices.append(self.frame_indices[-1])
+        print_status(
+            "GEOMETRY_CACHE",
+            "HIT",
+            path=cache_dir,
+            full_points=len(self.full_pcd.points),
+            accepted_keyframes=len(self.frame_indices),
+            semantic_keyframes=len(self.semantic_frame_indices),
+        )
+        return True
+
+    def _save_cached_geometry(self, cache_dir, signature, statistics):
+        """Persist geometry immediately, before allocating semantic features."""
+        metadata = {
+            "signature": signature,
+            "frame_indices": [int(index) for index in self.frame_indices],
+            "statistics": statistics,
+        }
+        point_cloud_path, metadata_path = save_geometry_cache(
+            cache_dir,
+            self.full_pcd,
+            metadata,
+        )
+        print_status(
+            "GEOMETRY_CACHE",
+            "SAVED",
+            point_cloud=point_cloud_path,
+            metadata=metadata_path,
+            full_points=len(self.full_pcd.points),
+            accepted_keyframes=len(self.frame_indices),
+        )
+
+    def _extract_semantic_feature_map(
+        self,
+        association_distance_m,
+        log_every_n_frames,
+    ):
+        """Run SAM/CLIP with bounded CPU allocations and explicit cleanup."""
+        locs_in = np.asarray(self.full_pcd.points)
+        tree_pcd = cKDTree(locs_in)
+        n_points = locs_in.shape[0]
+        accumulator_dtype = str(
+            self.cfg.pipeline.get("feature_accumulator_dtype", "float16")
+        )
+        normalization_chunk_points = max(
+            1,
+            int(
+                self.cfg.pipeline.get(
+                    "feature_normalization_chunk_points",
+                    32768,
+                )
+            ),
+        )
+        association_chunk_points = max(
+            1,
+            int(
+                self.cfg.pipeline.get(
+                    "feature_association_chunk_points",
+                    32768,
+                )
+            ),
+        )
+        cleanup_interval = max(
+            1,
+            int(self.cfg.pipeline.get("semantic_cleanup_interval", 1)),
+        )
+        accumulator = LowMemoryFeatureAccumulator(
+            n_points,
+            self.clip_feat_dim,
+            dtype=accumulator_dtype,
+            normalization_chunk_points=normalization_chunk_points,
+        )
+        print_status(
+            "FEATURE_ACCUMULATOR",
+            "OK",
+            points=n_points,
+            feature_dim=self.clip_feat_dim,
+            dtype=accumulator_dtype,
+            allocated_gib=round(accumulator.allocated_bytes / (1024 ** 3), 3),
+            association_chunk_points=association_chunk_points,
+            normalization_chunk_points=normalization_chunk_points,
+        )
+
+        frames_pcd = []
+        association_attempts = 0
+        association_accepted = 0
+        processed_frames = 0
+        for frame_position, i in enumerate(
+            tqdm(self.semantic_frame_indices, desc="Extracting features")
+        ):
+            rgb_image = depth_image = pose = None
+            feature_result = F_2D = F_masks = masks = F_g = None
+            pcd = masks_3d = None
+            flat_features = valid_pixel_indices = None
+            try:
+                rgb_image, depth_image, pose, _, _ = self.dataset[i]
+                if rgb_image.size != depth_image.size:
+                    rgb_image = rgb_image.resize(depth_image.size)
+                feature_result = extract_feats_per_pixel(
+                    np.array(rgb_image),
+                    self.mask_generator,
+                    self.clip_model,
+                    self.preprocess,
+                    clip_feat_dim=self.clip_feat_dim,
+                    bbox_margin=self.cfg.pipeline.clip_bbox_margin,
+                    maskedd_weight=self.cfg.pipeline.clip_masked_weight,
+                )
+                if feature_result is None or len(feature_result) != 4:
+                    print_status(
+                        "SEMANTIC_FRAME",
+                        "WARN",
+                        frame_index=i,
+                        reason="feature_extractor_returned_no_complete_result",
+                    )
+                    continue
+                F_2D, F_masks, masks, F_g = feature_result
+                if F_2D is None or F_masks is None or masks is None:
+                    print_status(
+                        "SEMANTIC_FRAME",
+                        "WARN",
+                        frame_index=i,
+                        reason="no_sam_masks",
+                    )
+                    continue
+                F_2D = F_2D.cpu()
+                pcd = self.dataset.create_pcd(rgb_image, depth_image, pose)
+                masks_3d = self.dataset.create_3d_masks(
+                    masks,
+                    depth_image,
+                    self.full_pcd,
+                    tree_pcd,
+                    pose,
+                    down_size=self.cfg.pipeline.voxel_size,
+                    filter_distance=self.cfg.pipeline.max_mask_distance,
+                    association_distance=association_distance_m,
+                )
+                masks_3d_before_filter = len(masks_3d)
+                masks_3d = [
+                    mask_pcd
+                    for mask_pcd in masks_3d
+                    if not mask_pcd.is_empty() and len(mask_pcd.points) > 0
+                ]
+                if masks_3d:
+                    frames_pcd.append(masks_3d)
+                    processed_frames += 1
+                if masks_3d_before_filter != len(masks_3d):
+                    print_status(
+                        "EMPTY_3D_MASK_FILTER",
+                        "OK",
+                        frame_index=i,
+                        masks_before=masks_3d_before_filter,
+                        masks_after=len(masks_3d),
+                        removed=masks_3d_before_filter - len(masks_3d),
+                    )
+
+                if isinstance(self.dataset, RealRobotDataset):
+                    _, valid_depth_mask = self.dataset.get_valid_depth_mask(
+                        depth_image
+                    )
+                else:
+                    valid_depth_mask = np.asarray(depth_image) > 0
+                valid_pixel_indices = np.flatnonzero(
+                    np.asarray(valid_depth_mask).reshape(-1)
+                ).astype(np.int64, copy=False)
+                flat_features = F_2D.reshape(-1, F_2D.shape[-1])
+                frame_points = np.asarray(pcd.points)
+                if frame_points.shape[0] != valid_pixel_indices.shape[0]:
+                    raise RuntimeError(
+                        "Point/feature count mismatch at frame "
+                        f"{i}: points={frame_points.shape[0]}, "
+                        f"features={valid_pixel_indices.shape[0]}"
+                    )
+
+                frame_associated = 0
+                association_attempts += int(frame_points.shape[0])
+                nearest_distances, nearest_indices = tree_pcd.query(
+                    frame_points,
+                    k=1,
+                    workers=-1,
+                )
+                for start in range(
+                    0,
+                    frame_points.shape[0],
+                    association_chunk_points,
+                ):
+                    end = min(
+                        frame_points.shape[0],
+                        start + association_chunk_points,
+                    )
+                    pixel_indices_chunk = torch.from_numpy(
+                        valid_pixel_indices[start:end]
+                    )
+                    feature_chunk = flat_features.index_select(
+                        0,
+                        pixel_indices_chunk,
+                    )
+                    feature_check = feature_chunk.to(dtype=torch.float32)
+                    finite_feature = torch.isfinite(feature_check).all(dim=1)
+                    nonzero_feature = (
+                        torch.linalg.vector_norm(feature_check, dim=1) > 0
+                    )
+                    distances = nearest_distances[start:end]
+                    indices = nearest_indices[start:end]
+                    association_mask = (
+                        np.isfinite(distances)
+                        & (distances <= association_distance_m)
+                    )
+                    association_mask &= (
+                        finite_feature & nonzero_feature
+                    ).numpy()
+                    accepted_count = int(np.count_nonzero(association_mask))
+                    if accepted_count:
+                        accepted_indices = torch.from_numpy(
+                            np.asarray(
+                                indices[association_mask],
+                                dtype=np.int64,
+                            )
+                        )
+                        accepted_features = feature_chunk[
+                            torch.from_numpy(association_mask)
+                        ]
+                        accumulator.add(accepted_indices, accepted_features)
+                        frame_associated += accepted_count
+                        del accepted_indices, accepted_features
+                    del (
+                        pixel_indices_chunk,
+                        feature_chunk,
+                        feature_check,
+                        finite_feature,
+                        nonzero_feature,
+                        distances,
+                        indices,
+                        association_mask,
+                    )
+                del nearest_distances, nearest_indices
+                association_accepted += frame_associated
+
+                should_log = (
+                    frame_position == 0
+                    or frame_position == len(self.semantic_frame_indices) - 1
+                    or (frame_position + 1) % log_every_n_frames == 0
+                )
+                if should_log:
+                    mask_point_count = sum(
+                        len(mask_pcd.points) for mask_pcd in masks_3d
+                    )
+                    print_status(
+                        "SEMANTIC_FRAME",
+                        "OK",
+                        frame_index=i,
+                        progress=(
+                            f"{frame_position + 1}/"
+                            f"{len(self.semantic_frame_indices)}"
+                        ),
+                        sam_masks=len(masks),
+                        mask_feature_shape=tuple(F_masks.shape),
+                        pixel_feature_shape=(
+                            int(valid_pixel_indices.shape[0]),
+                            int(flat_features.shape[1]),
+                        ),
+                        frame_points=len(pcd.points),
+                        associated_feature_points=frame_associated,
+                        masks_3d=len(masks_3d),
+                        masks_3d_points=mask_point_count,
+                    )
+            finally:
+                if (
+                    self.mask_generator is not None
+                    and hasattr(self.mask_generator, "predictor")
+                    and hasattr(self.mask_generator.predictor, "reset_image")
+                ):
+                    self.mask_generator.predictor.reset_image()
+                del (
+                    feature_result,
+                    F_2D,
+                    F_masks,
+                    masks,
+                    F_g,
+                    pcd,
+                    masks_3d,
+                    flat_features,
+                    valid_pixel_indices,
+                    rgb_image,
+                    depth_image,
+                    pose,
+                )
+                if (frame_position + 1) % cleanup_interval == 0:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+        if not frames_pcd:
+            print_status("SEMANTIC_EXTRACTION", "ERROR", reason="no_frames_processed")
+            raise RuntimeError("No frames produced SAM/CLIP features")
+        print_status(
+            "SEMANTIC_EXTRACTION",
+            "OK",
+            processed_frames=processed_frames,
+            total_selected_frames=len(self.semantic_frame_indices),
+            association_attempts=association_attempts,
+            association_accepted=association_accepted,
+            association_ratio=(
+                association_accepted / association_attempts
+                if association_attempts
+                else 0.0
+            ),
+        )
+
+        self.full_feats_array = accumulator.finalize()
+        accumulator.release_counts()
+        print_status(
+            "FEATURE_ACCUMULATOR",
+            "FINALIZED",
+            shape=tuple(self.full_feats_array.shape),
+            dtype=str(self.full_feats_array.dtype),
+        )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        masks_before_merge = sum(len(frame_masks) for frame_masks in frames_pcd)
+        if self.cfg.pipeline.merge_type == "hierarchical":
+            tqdm.write("Merging 3d masks hierarchically")
+            self.mask_pcds = hierarchical_merge(
+                frames_pcd,
+                self.cfg.pipeline.init_overlap_thresh,
+                self.cfg.pipeline.overlap_thresh_factor,
+                self.cfg.pipeline.voxel_size,
+                self.cfg.pipeline.iou_thresh,
+            )
+        elif self.cfg.pipeline.merge_type == "sequential":
+            tqdm.write("Merging 3d masks sequentially")
+            self.mask_pcds = seq_merge(
+                frames_pcd,
+                self.cfg.pipeline.init_overlap_thresh,
+                self.cfg.pipeline.voxel_size,
+                self.cfg.pipeline.iou_thresh,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported merge_type: {self.cfg.pipeline.merge_type}"
+            )
+        del frames_pcd
+        gc.collect()
+        print_status(
+            "MASK_MERGE",
+            "OK",
+            merge_type=self.cfg.pipeline.merge_type,
+            masks_before=masks_before_merge,
+            masks_after=len(self.mask_pcds),
+        )
+
+        min_pcd_points = int(self.cfg.pipeline.get("min_pcd_points", 100))
+        masks_before_size_filter = len(self.mask_pcds)
+        self.mask_pcds = [
+            mask_pcd
+            for mask_pcd in self.mask_pcds
+            if not mask_pcd.is_empty() and len(mask_pcd.points) >= min_pcd_points
+        ]
+        print_status(
+            "MASK_SIZE_FILTER",
+            "OK",
+            masks_before=masks_before_size_filter,
+            masks_after=len(self.mask_pcds),
+            minimum_points=min_pcd_points,
+        )
+
+        masks_feats = []
+        for _, mask_3d in tqdm(
+            enumerate(self.mask_pcds),
+            total=len(self.mask_pcds),
+            desc="Fusing features",
+        ):
+            sampled_mask = mask_3d.voxel_down_sample(
+                self.cfg.pipeline.voxel_size * 2
+            )
+            points = np.asarray(sampled_mask.points)
+            _, indices = tree_pcd.query(points, k=1, workers=-1)
+            feats = np.nan_to_num(self.full_feats_array[indices])
+            if feats.shape[0] == 0:
+                masks_feats.append(
+                    np.zeros(
+                        (1, self.clip_feat_dim),
+                        dtype=self.full_feats_array.dtype,
+                    )
+                )
+                continue
+            feats = feats_denoise_dbscan(feats, eps=0.01, min_points=100)
+            masks_feats.append(feats)
+        self.mask_feats = masks_feats
+        assert len(self.mask_pcds) == len(self.mask_feats)
+        print_status(
+            "FEATURE_MAP",
+            "OK",
+            full_points=len(self.full_pcd.points),
+            full_feature_shape=tuple(self.full_feats_array.shape),
+            object_masks=len(self.mask_pcds),
+            mask_features=len(self.mask_feats),
+        )
+
+        if not bool(
+            self.cfg.pipeline.get("retain_full_point_features", False)
+        ):
+            self.full_feats_array = []
+            del accumulator, tree_pcd, locs_in
+            gc.collect()
+            print_status(
+                "FULL_POINT_FEATURES",
+                "RELEASED",
+                reason="object_features_already_fused",
+            )
+
     def _processing_frame_indices(self):
         """Return geometry keyframes, or the configured stride as a fallback."""
         if self.frame_indices:
@@ -375,6 +857,57 @@ class Graph:
             fusion_batch_size=fusion_batch_size,
             log_every_n_frames=log_every_n_frames,
         )
+
+        outlier_nb_neighbors = max(
+            2,
+            int(self.cfg.pipeline.get("outlier_nb_neighbors", 20)),
+        )
+        outlier_std_ratio = float(
+            self.cfg.pipeline.get("outlier_std_ratio", 2.0)
+        )
+        if outlier_std_ratio <= 0:
+            raise ValueError("pipeline.outlier_std_ratio must be positive")
+
+        geometry_cache_enabled = bool(
+            self.cfg.pipeline.get("geometry_cache_enabled", True)
+        )
+        resume_geometry_cache = bool(
+            self.cfg.pipeline.get("resume_geometry_cache", True)
+        )
+        geometry_cache_dir = self._geometry_cache_dir(save_path)
+        geometry_signature = self._geometry_cache_signature(
+            geometry_skip_frames=geometry_skip_frames,
+            voxel_size=voxel_size,
+            fusion_batch_size=fusion_batch_size,
+            keyframe_translation_m=keyframe_translation_m,
+            keyframe_rotation_deg=keyframe_rotation_deg,
+            max_pose_translation_jump_m=max_pose_translation_jump_m,
+            max_pose_rotation_jump_deg=max_pose_rotation_jump_deg,
+            outlier_nb_neighbors=outlier_nb_neighbors,
+            outlier_std_ratio=outlier_std_ratio,
+        )
+        if (
+            geometry_cache_enabled
+            and resume_geometry_cache
+            and geometry_cache_dir is not None
+            and self._load_cached_geometry(
+                geometry_cache_dir,
+                geometry_signature,
+                semantic_skip_frames,
+            )
+        ):
+            self._extract_semantic_feature_map(
+                association_distance_m,
+                log_every_n_frames,
+            )
+            return
+        if geometry_cache_enabled and geometry_cache_dir is not None:
+            print_status(
+                "GEOMETRY_CACHE",
+                "MISS",
+                path=geometry_cache_dir,
+                reason="missing_or_signature_mismatch",
+            )
 
         # create the RGB-D point cloud
         self.full_pcd = o3d.geometry.PointCloud()
@@ -524,15 +1057,6 @@ class Graph:
             voxel_size=voxel_size
         )
         voxel_points = len(self.full_pcd.points)
-        outlier_nb_neighbors = max(
-            2,
-            int(self.cfg.pipeline.get("outlier_nb_neighbors", 20)),
-        )
-        outlier_std_ratio = float(
-            self.cfg.pipeline.get("outlier_std_ratio", 2.0)
-        )
-        if outlier_std_ratio <= 0:
-            raise ValueError("pipeline.outlier_std_ratio must be positive")
         if voxel_points > outlier_nb_neighbors:
             self.full_pcd, _ = self.full_pcd.remove_statistical_outlier(
                 nb_neighbors=outlier_nb_neighbors,
@@ -566,265 +1090,26 @@ class Graph:
                 "units, depth range, intrinsics, and pose files."
             )
 
-        # create tree from full point cloud
-        locs_in = np.array(self.full_pcd.points)
-        tree_pcd = cKDTree(locs_in)
-        n_points = locs_in.shape[0]
-        counter = torch.zeros((n_points, 1), device="cpu")
-        sum_features = torch.zeros((n_points, self.clip_feat_dim), device="cpu")
-
-        # extract features for each frame
-        frames_pcd = []
-        frames_feats = []
-        association_attempts = 0
-        association_accepted = 0
-        for frame_position, i in enumerate(
-            tqdm(self.semantic_frame_indices, desc="Extracting features")
-        ):
-            # frame_position is the index of the frame in the selected frames
-            # i is the index of the frame in the dataset
-            rgb_image, depth_image, pose, _, _ = self.dataset[i]
-            if rgb_image.size != depth_image.size:
-                rgb_image = rgb_image.resize(depth_image.size)
-            feature_result = extract_feats_per_pixel(
-                np.array(rgb_image),
-                self.mask_generator,
-                self.clip_model,
-                self.preprocess,
-                clip_feat_dim=self.clip_feat_dim,
-                bbox_margin=self.cfg.pipeline.clip_bbox_margin,
-                maskedd_weight=self.cfg.pipeline.clip_masked_weight,
-            )
-            if feature_result is None or len(feature_result) != 4:
-                print_status(
-                    "SEMANTIC_FRAME",
-                    "WARN",
-                    frame_index=i,
-                    reason="feature_extractor_returned_no_complete_result",
-                )
-                continue
-            F_2D, F_masks, masks, F_g = feature_result
-            # F_2D: pixel-level features, shape (H*W, D), feature for each pixel
-            # F_masks: mask-level features, shape (N_masks, D), feature for each mask(item)
-            # masks: list of masks, each mask is a binary mask of shape (H, W)
-            # F_g: global feature, shape (D,), feature for the whole image
-            if F_2D is None or F_masks is None or masks is None:
-                print_status(
-                    "SEMANTIC_FRAME",
-                    "WARN",
-                    frame_index=i,
-                    reason="no_sam_masks",
-                )
-                continue
-            F_2D = F_2D.cpu()
-            pcd = self.dataset.create_pcd(rgb_image, depth_image, pose)
-            masks_3d = self.dataset.create_3d_masks(
-                masks,
-                depth_image,
-                self.full_pcd,
-                tree_pcd,
-                pose,
-                down_size=self.cfg.pipeline.voxel_size,
-                filter_distance=self.cfg.pipeline.max_mask_distance,
-                association_distance=association_distance_m,
-            )
-            masks_3d_before_filter = len(masks_3d)
-            valid_mask_indices = [
-                mask_index
-                for mask_index, mask_pcd in enumerate(masks_3d)
-                if not mask_pcd.is_empty() and len(mask_pcd.points) > 0
-            ]
-            masks_3d = [masks_3d[index] for index in valid_mask_indices]
-            # change 2D mask to 3D mask, each mask is a point cloud
-            # frames_pcd is a list of 3D masks for each frame, each mask is a point cloud
-            if masks_3d:
-                frames_pcd.append(masks_3d)
-                # Keep the mask features aligned with the retained 3D masks.
-                # frames_feats is currently diagnostic state, but preserving
-                # alignment avoids future regressions if it is reused.
-                frames_feats.append(F_masks[valid_mask_indices])
-            if masks_3d_before_filter != len(masks_3d):
-                print_status(
-                    "EMPTY_3D_MASK_FILTER",
-                    "OK",
-                    frame_index=i,
-                    masks_before=masks_3d_before_filter,
-                    masks_after=len(masks_3d),
-                    removed=masks_3d_before_filter - len(masks_3d),
-                )
-            # fuse features for each point in the full pcd
-            if isinstance(self.dataset, RealRobotDataset):
-                _, mask = self.dataset.get_valid_depth_mask(depth_image)
-            else:
-                mask = np.array(depth_image) > 0
-            mask = torch.from_numpy(mask)
-            F_2D = F_2D[mask].to(dtype=torch.float32)
-            # using cKdtree to find the closest point in the full pcd for each point in frame pcd
-            frame_points = np.asarray(pcd.points)
-            if frame_points.shape[0] != F_2D.shape[0]:
-                raise RuntimeError(
-                    "Point/feature count mismatch at frame "
-                    f"{i}: points={frame_points.shape[0]}, features={F_2D.shape[0]}"
-                )
-            if frame_points.shape[0] > 0:
-                dis, idx = tree_pcd.query(frame_points, k=1, workers=-1)
-                finite_feature = torch.isfinite(F_2D).all(dim=1)
-                nonzero_feature = torch.linalg.vector_norm(F_2D, dim=1) > 0
-                association_mask = (
-                    np.isfinite(dis) & (dis <= association_distance_m)
-                )
-                association_mask &= (finite_feature & nonzero_feature).numpy()
-                association_attempts += int(frame_points.shape[0])
-                association_accepted += int(np.count_nonzero(association_mask))
-
-                if np.any(association_mask):
-                    accepted_indices = torch.from_numpy(
-                        np.asarray(idx[association_mask], dtype=np.int64)
-                    )
-                    accepted_features = F_2D[
-                        torch.from_numpy(association_mask)
-                    ]
-                    sum_features.index_add_(
-                        0,
-                        accepted_indices,
-                        accepted_features,
-                    )
-                    counter.index_add_(
-                        0,
-                        accepted_indices,
-                        torch.ones(
-                            (accepted_indices.numel(), 1),
-                            dtype=counter.dtype,
-                        ),
-                    )
-
-            should_log = (
-                frame_position == 0
-                or frame_position == len(self.semantic_frame_indices) - 1
-                or (frame_position + 1) % log_every_n_frames == 0
-            )
-            if should_log:
-                mask_point_count = sum(len(mask_pcd.points) for mask_pcd in masks_3d)
-                print_status(
-                    "SEMANTIC_FRAME",
-                    "OK",
-                    frame_index=i,
-                    progress=(
-                        f"{frame_position + 1}/"
-                        f"{len(self.semantic_frame_indices)}"
+        if geometry_cache_enabled and geometry_cache_dir is not None:
+            self._save_cached_geometry(
+                geometry_cache_dir,
+                geometry_signature,
+                {
+                    "raw_accumulated_points": int(raw_accumulated_points),
+                    "resident_points_before_final_voxel": int(
+                        resident_points_before_final_voxel
                     ),
-                    sam_masks=len(masks),
-                    mask_feature_shape=tuple(F_masks.shape),
-                    pixel_feature_shape=tuple(F_2D.shape),
-                    frame_points=len(pcd.points),
-                    associated_feature_points=(
-                        int(np.count_nonzero(association_mask))
-                        if frame_points.shape[0] > 0
-                        else 0
-                    ),
-                    masks_3d=len(masks_3d),
-                    masks_3d_points=mask_point_count,
-                )
-        if not frames_pcd:
-            print_status("SEMANTIC_EXTRACTION", "ERROR", reason="no_frames_processed")
-            raise RuntimeError("No frames produced SAM/CLIP features")
-        print_status(
-            "SEMANTIC_EXTRACTION",
-            "OK",
-            processed_frames=len(frames_pcd),
-            total_selected_frames=len(self.semantic_frame_indices),
-            association_attempts=association_attempts,
-            association_accepted=association_accepted,
-            association_ratio=(
-                association_accepted / association_attempts
-                if association_attempts
-                else 0.0
-            ),
-        )
-        # compute the average features
-        sum_features = sum_features / counter.clamp_min(1.0)
-        sum_features = torch.nn.functional.normalize(sum_features, p=2, dim=-1)
-        self.full_feats_array = sum_features.cpu().numpy()
-        self.full_feats_array: np.ndarray
-        
-        # free memory
-        del sum_features, counter
-        torch.cuda.empty_cache() 
-
-        # merging the masks
-        masks_before_merge = sum(len(frame_masks) for frame_masks in frames_pcd)
-        if self.cfg.pipeline.merge_type == "hierarchical":
-            tqdm.write("Merging 3d masks hierarchically")
-            self.mask_pcds = hierarchical_merge(
-                frames_pcd, 
-                self.cfg.pipeline.init_overlap_thresh, 
-                self.cfg.pipeline.overlap_thresh_factor, 
-                self.cfg.pipeline.voxel_size, 
-                self.cfg.pipeline.iou_thresh,
+                    "voxel_points": int(voxel_points),
+                    "denoised_points": int(len(self.full_pcd.points)),
+                    "semantic_skip_frames": int(semantic_skip_frames),
+                },
             )
-        elif self.cfg.pipeline.merge_type == "sequential":
-            tqdm.write("Merging 3d masks sequentially") 
-            self.mask_pcds = seq_merge(
-                frames_pcd, 
-                self.cfg.pipeline.init_overlap_thresh, 
-                self.cfg.pipeline.voxel_size, 
-                self.cfg.pipeline.iou_thresh
-            )
-        print_status(
-            "MASK_MERGE",
-            "OK",
-            merge_type=self.cfg.pipeline.merge_type,
-            masks_before=masks_before_merge,
-            masks_after=len(self.mask_pcds),
-        )
 
-        # Remove small masks before fusing object features. The threshold is
-        # configurable so real-robot runs can reject fragmented masks without
-        # silently changing the feature/mask alignment.
-        min_pcd_points = int(self.cfg.pipeline.get("min_pcd_points", 100))
-        masks_before_size_filter = len(self.mask_pcds)
-        self.mask_pcds = [
-            pcd
-            for pcd in self.mask_pcds
-            if not pcd.is_empty() and len(pcd.points) >= min_pcd_points
-        ]
-        print_status(
-            "MASK_SIZE_FILTER",
-            "OK",
-            masks_before=masks_before_size_filter,
-            masks_after=len(self.mask_pcds),
-            minimum_points=min_pcd_points,
+        self._extract_semantic_feature_map(
+            association_distance_m,
+            log_every_n_frames,
         )
-        # fuse point features in every 3d mask
-        masks_feats = []
-        for i, mask_3d in tqdm(enumerate(self.mask_pcds), desc="Fusing features"):
-            # find the points in the mask
-            mask_3d = mask_3d.voxel_down_sample(self.cfg.pipeline.voxel_size * 2)
-            points = np.asarray(mask_3d.points)
-            dist, idx = tree_pcd.query(points, k=1, workers=-1)
-            feats = self.full_feats_array[idx]
-            feats = np.nan_to_num(feats)
-            # filter feats with dbscan
-            if feats.shape[0] == 0:
-                masks_feats.append(
-                    np.zeros((1, self.clip_feat_dim), dtype=self.full_feats_array.dtype)
-                )
-                continue
-            feats = feats_denoise_dbscan(feats, eps=0.01, min_points=100)
-            masks_feats.append(feats)
-        self.mask_feats = masks_feats
-        print("number of masks: ", len(self.mask_feats))
-        print("number of pcds in hovsg: ", len(self.mask_pcds))
-        assert len(self.mask_pcds) == len(self.mask_feats)
-        print_status(
-            "FEATURE_MAP",
-            "OK",
-            full_points=len(self.full_pcd.points),
-            full_feature_shape=tuple(self.full_feats_array.shape),
-            object_masks=len(self.mask_pcds),
-            mask_features=len(self.mask_feats),
-        )
-
+        return
     def _robust_single_floor_bounds(self, points, floor_peak=None):
         """Estimate single-floor bounds while ignoring vertical outliers."""
         heights = np.asarray(points, dtype=np.float64)[:, 1]
