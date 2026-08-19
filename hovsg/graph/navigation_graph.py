@@ -968,6 +968,7 @@ class NavigationGraph:
         trajectory_noise_clearing_enabled: bool = True,
         trajectory_noise_clearing_radius_m: float = 0.10,
         trajectory_max_carved_obstacle_ratio: float = 0.05,
+        pose_region_is_free: bool = False,
     ) -> np.ndarray:
         """Get the free region of the floor as a grid map.
 
@@ -1092,13 +1093,21 @@ class NavigationGraph:
             cluster=cluster_pose_heights,
         )
         obstacle_before_trajectory = obstacle_confidence["retained"].astype(bool)
+        # In a handheld recording the operator may provide a stronger fact
+        # than the reconstructed point cloud: every camera position was
+        # physically traversable.  Keep the normal low-confidence cleanup,
+        # but do not fail it merely because the point cloud contradicts that
+        # fact; the final pose corridor is explicitly forced free below.
+        clearing_ratio_limit = (
+            1.0 if pose_region_is_free else trajectory_max_carved_obstacle_ratio
+        )
         raw_obstacle_map, trajectory_removed, trajectory_carved_ratio = (
             self.clear_low_confidence_obstacles_near_trajectory(
                 obstacle_before_trajectory,
                 obstacle_confidence["low_confidence"],
                 trajectory_clearance_map,
                 enabled=trajectory_noise_clearing_enabled,
-                max_carved_ratio=trajectory_max_carved_obstacle_ratio,
+                max_carved_ratio=clearing_ratio_limit,
             )
         )
         trajectory_removed_cells = int(np.count_nonzero(trajectory_removed))
@@ -1130,6 +1139,13 @@ class NavigationGraph:
             np.uint8
         )
         main_free_map = self.get_seeded_free_region(floor_free_map, poses_map)
+        if pose_region_is_free:
+            # The trajectory is guaranteed traversable by the user.  Apply
+            # this after obstacle inflation and connected-component pruning,
+            # otherwise a spurious obstacle can still erase a pose cell or a
+            # disconnected part of the recorded route.
+            main_free_map = np.asarray(main_free_map, dtype=np.uint8).copy()
+            main_free_map[poses_map > 0] = 1
         print_status(
             "NAVIGATION_GRID",
             "OK",
@@ -1163,6 +1179,10 @@ class NavigationGraph:
             trajectory_carved_ratio=trajectory_carved_ratio,
             trajectory_max_carved_obstacle_ratio=float(
                 trajectory_max_carved_obstacle_ratio
+            ),
+            pose_region_is_free=bool(pose_region_is_free),
+            forced_free_cells=(
+                int(np.count_nonzero(poses_map)) if pose_region_is_free else 0
             ),
             free_cells=int(np.count_nonzero(floor_free_map)),
             main_free_cells=int(np.count_nonzero(main_free_map)),
@@ -1225,6 +1245,11 @@ class NavigationGraph:
                 os.path.join(floor_dir, "floor_free_main.png"),
                 main_free_map.astype(np.uint8) * 255,
             )
+            if pose_region_is_free:
+                cv2.imwrite(
+                    os.path.join(floor_dir, "poses_forced_free.png"),
+                    poses_map.astype(np.uint8) * 255,
+                )
             cv2.imwrite(
                 os.path.join(floor_dir, "poses_center_map.png"),
                 pose_center_map.astype(np.uint8) * 255,
@@ -1233,6 +1258,7 @@ class NavigationGraph:
             pose_center_cells > 0
             and raw_obstacle_pose_center_overlap_ratio
             > max_raw_obstacle_pose_center_overlap_ratio
+            and not pose_region_is_free
         ):
             raise RuntimeError(
                 "Navigation rejected because the reconstructed obstacle cloud "
@@ -2091,6 +2117,9 @@ class NavigationGraph:
                 navigation_config.get(
                     "trajectory_max_carved_obstacle_ratio", 0.05
                 )
+            ),
+            pose_region_is_free=bool(
+                navigation_config.get("pose_region_is_free", False)
             ),
         ).astype(np.uint8)
         minimum_navigable_area_m2 = float(

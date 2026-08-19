@@ -213,6 +213,11 @@ navigation:
   trajectory_noise_clearing_enabled: true
   trajectory_noise_clearing_radius_m: 0.10
   trajectory_max_carved_obstacle_ratio: 0.05
+  # This recording was made along a route that the robot can physically use.
+  # Keep every 0.5 m pose neighborhood free after obstacle inflation, even
+  # when the reconstructed cloud contains a conflicting drift/noise artifact.
+  # Set false for recordings without this guarantee.
+  pose_region_is_free: true
   # Reject a navigation map when even the narrow center of the recorded path
   # is occupied. Clearing these cells would hide unresolved SLAM ghosting and
   # could remove real obstacles, so real-robot navigation fails closed.

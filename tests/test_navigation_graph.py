@@ -283,6 +283,39 @@ class NavigationGraphHandheldTest(unittest.TestCase):
                 max_raw_obstacle_pose_center_overlap_ratio=0.10,
             )
 
+    def test_guaranteed_pose_region_stays_free_after_obstacle_inflation(self):
+        points = np.vstack(
+            (
+                np.asarray(self.cloud.points),
+                np.repeat([[2.0, 0.50, 2.0]], 5, axis=0),
+            )
+        )
+        cloud = o3d.geometry.PointCloud()
+        cloud.points = o3d.utility.Vector3dVector(points)
+        nav = NavigationGraph(cloud, cell_size=0.1)
+
+        free_map = nav.get_main_free_map(
+            cloud,
+            {
+                "floor_zero_level": 0.0,
+                "floor_height": 3.0,
+                "ground_height_family": [0.0],
+            },
+            floor_poses_list=[make_pose(2.0, 1.0, 2.0)],
+            save=False,
+            pose_region_radius=0.2,
+            pose_center_radius_m=0.05,
+            obstacle_inflation_radius_m=0.4,
+            obstacle_radius_filter_enabled=False,
+            obstacle_min_component_cells=1,
+            trajectory_noise_clearing_enabled=False,
+            max_raw_obstacle_pose_center_overlap_ratio=0.0,
+            pose_region_is_free=True,
+        )
+
+        grid = nav.to_grid(np.asarray([2.0, 0.0, 2.0]))[[0, 2]]
+        self.assertEqual(free_map[grid[1], grid[0]], 1)
+
 
 
 if __name__ == "__main__":
