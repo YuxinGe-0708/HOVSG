@@ -1,0 +1,105 @@
+{
+  "point_cloud": "D:\\orbbec_transfer\\test_decoupled\\full_pcd.ply",
+  "finite_cropped_points": 1797174,
+  "ground_height_family_m": [
+    -0.7908009297583187,
+    -0.4936490240462198,
+    -0.12737313800660457,
+    0.2557106467632832
+  ],
+  "grid_shape": [
+    626,
+    714
+  ],
+  "ground_points": 548298,
+  "obstacle_points": 1049057,
+  "ground_cells": 112037,
+  "raw_obstacle_cells": 74352,
+  "inflated_obstacle_cells": 205084,
+  "candidate_peak_classification": [
+    {
+      "height_m": -0.7908009297583187,
+      "in_ground_family": true,
+      "points_in_0.08m_band": 33940,
+      "classified_ground_ratio": 1.0,
+      "classified_obstacle_ratio": 0.0
+    },
+    {
+      "height_m": -0.4936490240462198,
+      "in_ground_family": true,
+      "points_in_0.08m_band": 78277,
+      "classified_ground_ratio": 1.0,
+      "classified_obstacle_ratio": 0.0
+    },
+    {
+      "height_m": -0.12737313800660457,
+      "in_ground_family": true,
+      "points_in_0.08m_band": 189981,
+      "classified_ground_ratio": 1.0,
+      "classified_obstacle_ratio": 0.0
+    },
+    {
+      "height_m": 0.2557106467632832,
+      "in_ground_family": true,
+      "points_in_0.08m_band": 159119,
+      "classified_ground_ratio": 1.0,
+      "classified_obstacle_ratio": 0.0
+    },
+    {
+      "height_m": 0.7048002031835379,
+      "in_ground_family": false,
+      "points_in_0.08m_band": 113688,
+      "classified_ground_ratio": 0.0,
+      "classified_obstacle_ratio": 1.0
+    },
+    {
+      "height_m": 0.9041754573247548,
+      "in_ground_family": false,
+      "points_in_0.08m_band": 98640,
+      "classified_ground_ratio": 0.0,
+      "classified_obstacle_ratio": 1.0
+    },
+    {
+      "height_m": 1.320260752772384,
+      "in_ground_family": false,
+      "points_in_0.08m_band": 91140,
+      "classified_ground_ratio": 0.0,
+      "classified_obstacle_ratio": 1.0
+    },
+    {
+      "height_m": 2.6551957821365146,
+      "in_ground_family": false,
+      "points_in_0.08m_band": 13458,
+      "classified_ground_ratio": 0.0,
+      "classified_obstacle_ratio": 0.0
+    }
+  ],
+  "poses_map_shape": [
+    626,
+    714
+  ],
+  "pose_cells": 31245,
+  "raw_obstacle_pose_overlap_cells": 8616,
+  "raw_obstacle_pose_overlap_ratio": 0.2757561209793567,
+  "inflated_obstacle_pose_overlap_ratio": 0.8049607937269964,
+  "pose_center_cells": 11842,
+  "raw_obstacle_pose_center_overlap_ratio": 0.21221077520689072,
+  "inflated_obstacle_pose_center_overlap_ratio": 0.8023137983448742,
+  "baseline_comparison": {
+    "ground": {
+      "old_cells": 74780,
+      "new_cells": 112037,
+      "change_ratio": 0.49822144958545067
+    },
+    "raw_obstacle": {
+      "old_cells": 76391,
+      "new_cells": 74352,
+      "change_ratio": -0.026691625976882093
+    },
+    "inflated_obstacle": {
+      "old_cells": 191807,
+      "new_cells": 205084,
+      "change_ratio": 0.06922062281355738
+    }
+  }
+}

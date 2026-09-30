@@ -1,0 +1,227 @@
+{
+  "point_cloud": "D:\\orbbec_transfer\\test_decoupled\\full_pcd.ply",
+  "finite_cropped_points": 1797510,
+  "ground_height_family_m": [
+    -0.7952657350253978,
+    -0.4901979677073493,
+    -0.13756677011084273,
+    0.25361512962038113
+  ],
+  "grid_shape": [
+    626,
+    714
+  ],
+  "ground_points": 548303,
+  "obstacle_points": 1043021,
+  "ground_cells": 112419,
+  "raw_obstacle_cells": 72856,
+  "inflated_obstacle_cells": 204901,
+  "candidate_peak_classification": [
+    {
+      "height_m": -0.7952657350253978,
+      "in_ground_family": true,
+      "points_in_0.08m_band": 33249,
+      "classified_ground_ratio": 1.0,
+      "classified_obstacle_ratio": 0.0
+    },
+    {
+      "height_m": -0.4901979677073493,
+      "in_ground_family": true,
+      "points_in_0.08m_band": 78784,
+      "classified_ground_ratio": 1.0,
+      "classified_obstacle_ratio": 0.0
+    },
+    {
+      "height_m": -0.13756677011084273,
+      "in_ground_family": true,
+      "points_in_0.08m_band": 189697,
+      "classified_ground_ratio": 1.0,
+      "classified_obstacle_ratio": 0.0
+    },
+    {
+      "height_m": 0.25361512962038113,
+      "in_ground_family": true,
+      "points_in_0.08m_band": 158825,
+      "classified_ground_ratio": 1.0,
+      "classified_obstacle_ratio": 0.0
+    },
+    {
+      "height_m": 0.692704224118769,
+      "in_ground_family": false,
+      "points_in_0.08m_band": 113751,
+      "classified_ground_ratio": 0.0,
+      "classified_obstacle_ratio": 1.0
+    },
+    {
+      "height_m": 0.9083372193517538,
+      "in_ground_family": false,
+      "points_in_0.08m_band": 98371,
+      "classified_ground_ratio": 0.0,
+      "classified_obstacle_ratio": 1.0
+    },
+    {
+      "height_m": 1.317361662358785,
+      "in_ground_family": false,
+      "points_in_0.08m_band": 91391,
+      "classified_ground_ratio": 0.0,
+      "classified_obstacle_ratio": 1.0
+    },
+    {
+      "height_m": 2.6533938727129796,
+      "in_ground_family": false,
+      "points_in_0.08m_band": 13353,
+      "classified_ground_ratio": 0.0,
+      "classified_obstacle_ratio": 0.0
+    }
+  ],
+  "poses_map_shape": [
+    626,
+    714
+  ],
+  "pose_cells": 31245,
+  "raw_obstacle_pose_overlap_cells": 8568,
+  "raw_obstacle_pose_overlap_ratio": 0.2742198751800288,
+  "inflated_obstacle_pose_overlap_ratio": 0.8054088654184669,
+  "pose_center_cells": 11842,
+  "raw_obstacle_pose_center_overlap_ratio": 0.21119743286606993,
+  "inflated_obstacle_pose_center_overlap_ratio": 0.7997804424928222,
+  "pose_center_obstacle_height_histogram": [
+    {
+      "min_height_m": -0.6952657350253978,
+      "max_height_m": -0.5952657350253978,
+      "points": 2362
+    },
+    {
+      "min_height_m": -0.5952657350253978,
+      "max_height_m": -0.49526573502539784,
+      "points": 216
+    },
+    {
+      "min_height_m": -0.39526573502539786,
+      "max_height_m": -0.2952657350253979,
+      "points": 1291
+    },
+    {
+      "min_height_m": -0.2952657350253979,
+      "max_height_m": -0.1952657350253979,
+      "points": 2884
+    },
+    {
+      "min_height_m": 0.004734264974602054,
+      "max_height_m": 0.10473426497460203,
+      "points": 2969
+    },
+    {
+      "min_height_m": 0.10473426497460203,
+      "max_height_m": 0.204734264974602,
+      "points": 1977
+    },
+    {
+      "min_height_m": 0.3047342649746019,
+      "max_height_m": 0.40473426497460196,
+      "points": 11
+    },
+    {
+      "min_height_m": 0.40473426497460196,
+      "max_height_m": 0.504734264974602,
+      "points": 1905
+    },
+    {
+      "min_height_m": 0.504734264974602,
+      "max_height_m": 0.6047342649746019,
+      "points": 699
+    },
+    {
+      "min_height_m": 0.6047342649746019,
+      "max_height_m": 0.7047342649746018,
+      "points": 618
+    },
+    {
+      "min_height_m": 0.7047342649746018,
+      "max_height_m": 0.8047342649746019,
+      "points": 782
+    },
+    {
+      "min_height_m": 0.8047342649746019,
+      "max_height_m": 0.904734264974602,
+      "points": 579
+    },
+    {
+      "min_height_m": 0.904734264974602,
+      "max_height_m": 1.0047342649746018,
+      "points": 556
+    },
+    {
+      "min_height_m": 1.0047342649746018,
+      "max_height_m": 1.1047342649746017,
+      "points": 362
+    },
+    {
+      "min_height_m": 1.1047342649746017,
+      "max_height_m": 1.2047342649746018,
+      "points": 375
+    },
+    {
+      "min_height_m": 1.2047342649746018,
+      "max_height_m": 1.3047342649746019,
+      "points": 445
+    },
+    {
+      "min_height_m": 1.3047342649746019,
+      "max_height_m": 1.4047342649746015,
+      "points": 404
+    },
+    {
+      "min_height_m": 1.4047342649746015,
+      "max_height_m": 1.5047342649746016,
+      "points": 208
+    },
+    {
+      "min_height_m": 1.5047342649746016,
+      "max_height_m": 1.6047342649746017,
+      "points": 161
+    },
+    {
+      "min_height_m": 1.6047342649746017,
+      "max_height_m": 1.7047342649746018,
+      "points": 189
+    },
+    {
+      "min_height_m": 1.7047342649746018,
+      "max_height_m": 1.8047342649746019,
+      "points": 539
+    },
+    {
+      "min_height_m": 1.8047342649746019,
+      "max_height_m": 1.9047342649746015,
+      "points": 79
+    },
+    {
+      "min_height_m": 1.9047342649746015,
+      "max_height_m": 2.0047342649746014,
+      "points": 53
+    },
+    {
+      "min_height_m": 2.0047342649746014,
+      "max_height_m": 2.104734264974602,
+      "points": 54
+    }
+  ],
+  "baseline_comparison": {
+    "ground": {
+      "old_cells": 74780,
+      "new_cells": 112419,
+      "change_ratio": 0.5033297673174646
+    },
+    "raw_obstacle": {
+      "old_cells": 76391,
+      "new_cells": 72856,
+      "change_ratio": -0.04627508476129387
+    },
+    "inflated_obstacle": {
+      "old_cells": 191807,
+      "new_cells": 204901,
+      "change_ratio": 0.06826653876031635
+    }
+  }
+}
