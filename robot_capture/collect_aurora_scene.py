@@ -23,6 +23,7 @@ from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image
 from tf2_ros import Buffer, TransformException, TransformListener
+from camera_geometry import projection_metadata
 
 
 FRAME_FIELDS = [
@@ -414,16 +415,12 @@ class SceneCollector(Node):
     def _write_camera_json(
         self, info: CameraInfo, rgb_msg: Image, depth_msg: Image, camera_frame: str
     ):
-        if len(info.k) != 9:
-            raise ValueError("CameraInfo.k does not contain a 3x3 matrix")
+        calibration = projection_metadata(info, image_rectified=self.args.image_rectified)
         data = {
             "schema_version": 1,
             "width": int(rgb_msg.width),
             "height": int(rgb_msg.height),
-            "fx": float(info.k[0]),
-            "fy": float(info.k[4]),
-            "cx": float(info.k[2]),
-            "cy": float(info.k[5]),
+            **calibration,
             "depth_meters_per_unit": float(self.args.depth_scale),
             "min_depth_m": float(self.args.min_depth),
             "max_depth_m": float(self.args.max_depth),
@@ -475,6 +472,7 @@ class SceneCollector(Node):
                 "distortion_model",
                 "distortion_coefficients",
                 "image_rectified",
+                "rectification_rotation",
                 "pose_timestamp_policy",
                 "max_rgb_depth_skew_ms",
                 "max_pose_skew_ms",
@@ -527,6 +525,7 @@ class SceneCollector(Node):
             "distortion_model",
             "distortion_coefficients",
             "image_rectified",
+            "rectification_rotation",
             "camera_frame_axes",
         )
         template_path = room_dir / "camera_template.json"

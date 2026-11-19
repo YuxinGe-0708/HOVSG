@@ -13,13 +13,14 @@ import torch
 
 
 class LowMemoryFeatureAccumulator:
-    """Accumulate per-point CLIP features without a second full-size copy.
+    """Accumulate per-point CLIP means without a second full-size copy.
 
     The historical implementation used a float32 ``N x D`` tensor and then
     created additional float32 tensors while averaging and normalizing it.
     For a 3.7 million point, 1024-dimensional map that single tensor is about
-    14.2 GiB.  This accumulator stores sums in float16 and performs final
-    averaging/normalization in bounded float32 chunks.
+    14.2 GiB. Store running means in float16, reducing duplicate observations
+    in float32 batches. Raw float16 sums lose increments or overflow when many
+    pixels/frames associate to the same map point.
     """
 
     _DTYPES = {
@@ -49,7 +50,7 @@ class LowMemoryFeatureAccumulator:
         self.dtype_name = dtype
         self.dtype = self._DTYPES[dtype]
         self.normalization_chunk_points = int(normalization_chunk_points)
-        self.sums = torch.zeros(
+        self.means = torch.zeros(
             (int(point_count), int(feature_dim)),
             dtype=self.dtype,
             device="cpu",
@@ -66,14 +67,14 @@ class LowMemoryFeatureAccumulator:
     def allocated_bytes(self) -> int:
         """Return bytes owned by the persistent accumulator tensors."""
         return (
-            self.sums.numel() * self.sums.element_size()
+            self.means.numel() * self.means.element_size()
             + self.counts.numel() * self.counts.element_size()
         )
 
     def add(self, indices: torch.Tensor, features: torch.Tensor) -> None:
         """Add one bounded batch of features to their global point indices."""
         indices = indices.to(device="cpu", dtype=torch.long)
-        features = features.to(device="cpu", dtype=self.dtype)
+        features = features.to(device="cpu", dtype=torch.float32)
         if indices.ndim != 1:
             raise ValueError("indices must be one-dimensional")
         if features.ndim != 2:
@@ -82,30 +83,37 @@ class LowMemoryFeatureAccumulator:
             raise ValueError("indices and features must contain the same rows")
         if not indices.numel():
             return
-        if features.shape[1] != self.sums.shape[1]:
+        if features.shape[1] != self.means.shape[1]:
             raise ValueError("feature dimension does not match accumulator")
+        if indices.min() < 0 or indices.max() >= self.means.shape[0]:
+            raise ValueError("point index outside accumulator")
 
-        self.sums.index_add_(0, indices, features)
-        self.counts.index_add_(
-            0,
-            indices,
-            torch.ones((indices.numel(), 1), dtype=self.counts.dtype),
+        unique_indices, inverse = torch.unique(indices, return_inverse=True)
+        batch_sums = torch.zeros(
+            (unique_indices.numel(), features.shape[1]), dtype=torch.float32
         )
+        batch_sums.index_add_(0, inverse, features)
+        batch_counts = torch.bincount(inverse).to(torch.float32).unsqueeze(1)
+        old_counts = self.counts[unique_indices]
+        new_counts = old_counts + batch_counts
+        means = self.means[unique_indices].to(torch.float32)
+        means = (means * old_counts + batch_sums) / new_counts
+        self.means[unique_indices] = means.to(self.dtype)
+        self.counts[unique_indices] = new_counts
 
     def finalize(self) -> np.ndarray:
-        """Average and L2-normalize in-place, returning a float16/32 view."""
-        point_count = self.sums.shape[0]
+        """L2-normalize means in-place, returning a float16/32 view."""
+        point_count = self.means.shape[0]
         for start in range(0, point_count, self.normalization_chunk_points):
             end = min(point_count, start + self.normalization_chunk_points)
-            chunk = self.sums[start:end].to(dtype=torch.float32)
-            chunk /= self.counts[start:end].clamp_min(1.0)
+            chunk = self.means[start:end].to(dtype=torch.float32)
             chunk = torch.nn.functional.normalize(chunk, p=2, dim=-1)
-            self.sums[start:end].copy_(chunk.to(dtype=self.dtype))
+            self.means[start:end].copy_(chunk.to(dtype=self.dtype))
             del chunk
-        return self.sums.numpy()
+        return self.means.numpy()
 
     def release_counts(self) -> None:
-        """Release counters after finalization while retaining feature sums."""
+        """Release counters after finalization while retaining features."""
         self.counts = torch.empty((0, 1), dtype=torch.float32)
 
 

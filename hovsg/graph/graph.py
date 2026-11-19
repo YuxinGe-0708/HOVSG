@@ -59,6 +59,7 @@ from hovsg.utils.label_feats import get_label_feats
 from hovsg.utils.constants import MATTERPORT_GT_LABELS, CLIP_DIM
 from hovsg.utils.runtime_status import print_status
 from hovsg.utils.floor_estimation import estimate_single_floor_geometry
+from hovsg.utils.geometry_cache_inputs import dataset_geometry_signature
 from hovsg.utils.feature_map_memory import (
     LowMemoryFeatureAccumulator,
     load_geometry_cache,
@@ -266,7 +267,8 @@ class Graph:
     ):
         """Describe every input that changes the fused geometry."""
         return {
-            "version": 1,
+            "version": 2,
+            "dataset_inputs": dataset_geometry_signature(self.dataset),
             "dataset_path": os.path.realpath(str(self.cfg.main.dataset_path)),
             "dataset_frames": int(len(self.dataset)),
             "geometry_skip_frames": int(geometry_skip_frames),
@@ -435,7 +437,9 @@ class Graph:
                     )
                     continue
                 F_2D = F_2D.cpu()
-                pcd = self.dataset.create_pcd(rgb_image, depth_image, pose)
+                pcd, valid_pixel_indices = self.dataset.create_pcd(
+                    rgb_image, depth_image, pose, return_pixel_indices=True
+                )
                 masks_3d = self.dataset.create_3d_masks(
                     masks,
                     depth_image,
@@ -465,15 +469,8 @@ class Graph:
                         removed=masks_3d_before_filter - len(masks_3d),
                     )
 
-                if isinstance(self.dataset, RealRobotDataset):
-                    _, valid_depth_mask = self.dataset.get_valid_depth_mask(
-                        depth_image
-                    )
-                else:
-                    valid_depth_mask = np.asarray(depth_image) > 0
-                valid_pixel_indices = np.flatnonzero(
-                    np.asarray(valid_depth_mask).reshape(-1)
-                ).astype(np.int64, copy=False)
+                if tuple(F_2D.shape[:2]) != np.asarray(depth_image).shape:
+                    raise RuntimeError(f"Feature/depth resolution mismatch at frame {i}")
                 flat_features = F_2D.reshape(-1, F_2D.shape[-1])
                 frame_points = np.asarray(pcd.points)
                 if frame_points.shape[0] != valid_pixel_indices.shape[0]:

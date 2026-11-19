@@ -2,10 +2,11 @@
 import os 
 import numpy as np
 from PIL import Image
-import torchvision
 import open3d as o3d
+from pathlib import Path
 
 from hovsg.dataloader.generic import RGBDDataset
+from hovsg.utils.frame_matching import match_frame_paths
 
 
 class ScannetDataset(RGBDDataset):
@@ -26,8 +27,8 @@ class ScannetDataset(RGBDDataset):
         super(ScannetDataset, self).__init__(cfg)
         self.root_dir = cfg["root_dir"]
         self.transforms = cfg["transforms"]
-        self.rgb_intrinsics = self._load_rgb_intrinsics(self.root_dir + "intrinsic/intrinsic_color.txt")
-        self.depth_intrinsics = self._load_depth_intrinsics(self.root_dir + "intrinsic/intrinsic_depth.txt")
+        self.rgb_intrinsics = self._load_rgb_intrinsics(Path(self.root_dir) / "intrinsic/intrinsic_color.txt")
+        self.depth_intrinsics = self._load_depth_intrinsics(Path(self.root_dir) / "intrinsic/intrinsic_depth.txt")
         self.scale = 1000.0
         self.data_list = self._get_data_list()
         
@@ -63,17 +64,16 @@ class ScannetDataset(RGBDDataset):
         rgb_data_list = []
         depth_data_list = []
         pose_data_list = []
-        rgb_data_list = os.listdir(self.root_dir + "color")
-        rgb_data_list = [self.root_dir + "color/" + x for x in rgb_data_list]
-        depth_data_list = os.listdir(self.root_dir + "depth")
-        depth_data_list = [self.root_dir + "depth/" + x for x in depth_data_list]
-        pose_data_list = os.listdir(self.root_dir + "pose")
-        pose_data_list = [self.root_dir + "pose/" + x for x in pose_data_list]
+        root = Path(self.root_dir)
+        rgb_data_list = [p for p in (root / "color").iterdir()
+                         if p.suffix.lower() in {".jpg", ".jpeg", ".png"} and p.is_file()]
+        depth_data_list = list((root / "depth").glob("*.png"))
+        pose_data_list = list((root / "pose").glob("*.txt"))
         # sort the data list
         rgb_data_list.sort()
         depth_data_list.sort()
         pose_data_list.sort()
-        return list(zip(rgb_data_list, depth_data_list, pose_data_list))
+        return match_frame_paths(rgb_data_list, depth_data_list, pose_data_list)
         
     
     def _get_test_data_list(self):
@@ -198,6 +198,3 @@ class ScannetDataset(RGBDDataset):
         pcd1.points = o3d.utility.Vector3dVector(pcd)
         pcd1.colors = o3d.utility.Vector3dVector(colors)
         return pcd1
-
-    
-    

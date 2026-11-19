@@ -7,10 +7,11 @@ import os
 import math
 import numpy as np
 from PIL import Image
-import torchvision
 import open3d as o3d
+from pathlib import Path
 
 from hovsg.dataloader.generic import RGBDDataset
+from hovsg.utils.frame_matching import match_frame_paths
 
 # pylint: disable=all
 
@@ -66,17 +67,15 @@ class HM3DSemDataset(RGBDDataset):
         rgb_data_list = []
         depth_data_list = []
         pose_data_list = []
-        rgb_data_list = os.listdir(self.root_dir + "/rgb")
-        rgb_data_list = [self.root_dir + "/rgb/" + x for x in rgb_data_list]
-        depth_data_list = os.listdir(self.root_dir + "/depth")
-        depth_data_list = [self.root_dir + "/depth/" + x for x in depth_data_list]
-        pose_data_list = os.listdir(self.root_dir + "/pose")
-        pose_data_list = [self.root_dir + "/pose/" + x for x in pose_data_list]
+        root = Path(self.root_dir)
+        rgb_data_list = list((root / "rgb").glob("*.png"))
+        depth_data_list = list((root / "depth").glob("*.png"))
+        pose_data_list = list((root / "pose").glob("*.txt"))
         # sort the data list
         rgb_data_list.sort()
         depth_data_list.sort()
         pose_data_list.sort()
-        return list(zip(rgb_data_list, depth_data_list, pose_data_list))
+        return match_frame_paths(rgb_data_list, depth_data_list, pose_data_list)
         
     def _load_image(self, path):
         """

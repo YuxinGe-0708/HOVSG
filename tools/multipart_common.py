@@ -239,6 +239,7 @@ def camera_signature(camera):
         "distortion_model",
         "distortion_coefficients",
         "image_rectified",
+        "rectification_rotation",
         "camera_frame_axes",
         "pose_convention",
     ]

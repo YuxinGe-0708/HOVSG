@@ -1,18 +1,5 @@
-import argparse
-import ast
-from pathlib import Path
-import time
-
-import cv2
-import matplotlib.pyplot as plt
 import numpy as np
-import open_clip
-from PIL import Image
-from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
 import torch
-
-from hovsg.utils.clip_utils import get_img_feats, get_img_feats_batch
-from hovsg.utils.sam_utils import crop_all_bounding_boxs, filter_masks
 
 
 def extract_feats_raw(
@@ -38,6 +25,10 @@ def extract_feats_raw(
     LOAD_IMG_HEIGHT, LOAD_IMG_WIDTH = image.shape[0], image.shape[1]
     # run SAM on the full image.
     masks = mask_generator.generate(image)
+    if not masks:
+        return None, None, [], None
+    from hovsg.utils.clip_utils import get_img_feats
+    from hovsg.utils.sam_utils import crop_all_bounding_boxs
     # run CLIP on the full image.
     F_g = get_img_feats(image, preprocess, clip_model)
     # crop all masks above certain thershold.
@@ -100,6 +91,10 @@ def extract_feats_per_pixel(
 
     # if nothing is loaded, then generate a mask with SAM
     masks = mask_generator.generate(image)
+    if not masks:
+        return None, None, [], None
+    from hovsg.utils.clip_utils import get_img_feats, get_img_feats_batch
+    from hovsg.utils.sam_utils import crop_all_bounding_boxs
     # masks = filter_masks(masks)
     # run CLIP on the full image.
     F_g = None
@@ -117,7 +112,7 @@ def extract_feats_per_pixel(
     fused_crop_feats = torch.from_numpy(maskedd_weight * cropped_masked_feats + (1 - maskedd_weight) * cropped_feats)
     F_l = torch.nn.functional.normalize(fused_crop_feats, p=2, dim=-1).cpu().numpy()
     if F_l.shape[0] == 0:
-        return None, None, None
+        return None, None, [], F_g
     # 1. compute the cosine similarity etween the local feature fLi and the global feature fG.
     cos = torch.nn.CosineSimilarity(dim=-1, eps=1e-6)
     phi_l_G = cos(torch.from_numpy(F_l), torch.from_numpy(F_g))

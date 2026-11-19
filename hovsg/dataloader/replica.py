@@ -4,8 +4,10 @@ import numpy as np
 from PIL import Image
 import json
 import open3d as o3d
+from pathlib import Path
 
 from hovsg.dataloader.generic import RGBDDataset
+from hovsg.utils.frame_matching import match_frame_paths
 
 class ReplicaDataset(RGBDDataset):
     """
@@ -25,7 +27,7 @@ class ReplicaDataset(RGBDDataset):
         super(ReplicaDataset, self).__init__(cfg)
         self.root_dir = cfg["root_dir"]
         self.transforms = cfg["transforms"]
-        self.depth_intrinsics, self.scale = self._load_depth_intrinsics(os.path.split(self.root_dir)[0] + "/cam_params.json")
+        self.depth_intrinsics, self.scale = self._load_depth_intrinsics(Path(self.root_dir).parent / "cam_params.json")
         self.data_list = self._get_data_list()
         
     def __getitem__(self, idx):
@@ -41,7 +43,8 @@ class ReplicaDataset(RGBDDataset):
         rgb_path, depth_path = self.data_list[idx]
         rgb_image = self._load_image(rgb_path)
         depth_image = self._load_depth(depth_path)
-        pose = self._load_pose(self.root_dir, idx)
+        source_frame_id = int(Path(rgb_path).stem[len("frame"):])
+        pose = self._load_pose(self.root_dir, source_frame_id)
         if self.transforms is not None:
             # convert to Tensor
             rgb_image = self.transforms(rgb_image)
@@ -68,7 +71,7 @@ class ReplicaDataset(RGBDDataset):
         # sort the data list
         rgb_data_list.sort()
         depth_data_list.sort()
-        return list(zip(rgb_data_list, depth_data_list))
+        return match_frame_paths(rgb_data_list, depth_data_list, prefixes=["frame", "depth"])
         
     def _load_image(self, path):
         """
@@ -117,6 +120,7 @@ class ReplicaDataset(RGBDDataset):
                 # Reshape the 16 values into a 4x4 matrix
                 transformation_matrix = np.array(values).reshape((4, 4))
                 return transformation_matrix
+            raise ValueError(f"Missing trajectory pose for source frame {idx}: {path}")
     
     def _load_depth_intrinsics(self, path):
         """

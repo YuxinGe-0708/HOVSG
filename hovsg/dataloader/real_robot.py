@@ -131,7 +131,8 @@ class RealRobotDataset(RGBDDataset):
             if configured_max_depth is None
             else configured_max_depth
         )
-        if self.min_depth_m < 0 or self.max_depth_m <= self.min_depth_m:
+        if (not np.isfinite([self.min_depth_m, self.max_depth_m]).all()
+                or self.min_depth_m < 0 or self.max_depth_m <= self.min_depth_m):
             raise ValueError(
                 "Invalid depth range: "
                 f"min_depth_m={self.min_depth_m}, max_depth_m={self.max_depth_m}"
@@ -182,6 +183,14 @@ class RealRobotDataset(RGBDDataset):
                 "distortion_coefficients must contain a supported CameraInfo D vector"
             )
         self.image_rectified = bool(camera.get("image_rectified", False))
+        self.rectification_rotation = np.asarray(
+            camera.get("rectification_rotation", np.eye(3)), dtype=np.float64
+        )
+        rotation_pose = np.eye(4)
+        if self.rectification_rotation.shape != (3, 3):
+            raise ValueError("rectification_rotation must be a 3x3 matrix")
+        rotation_pose[:3, :3] = self.rectification_rotation
+        as_pose_matrix(rotation_pose, name="rectification_rotation")
         if (
             not self.image_rectified
             and self.distortion_coefficients.size
@@ -206,6 +215,12 @@ class RealRobotDataset(RGBDDataset):
             dtype=np.float64,
         )
         self.rgb_intrinsics = self.depth_intrinsics.copy()
+        if (self.width <= 0 or self.height <= 0
+                or not np.isfinite(self.depth_intrinsics).all()
+                or self.depth_intrinsics[0, 0] <= 0
+                or self.depth_intrinsics[1, 1] <= 0
+                or not np.isfinite(self.distortion_coefficients).all()):
+            raise ValueError("Camera dimensions, focal lengths and distortion must be valid")
         print_status(
             "REAL_ROBOT_CAMERA",
             "OK",
@@ -293,11 +308,13 @@ class RealRobotDataset(RGBDDataset):
 
     @staticmethod
     def _index_files(directory, allowed_suffixes):
-        return {
-            path.stem: path
-            for path in directory.iterdir()
-            if path.is_file() and path.suffix.lower() in allowed_suffixes
-        }
+        files = {}
+        for path in directory.iterdir():
+            if path.is_file() and path.suffix.lower() in allowed_suffixes:
+                if path.stem in files:
+                    raise ValueError(f"Duplicate frame ID {path.stem} in {directory}")
+                files[path.stem] = path
+        return files
 
     def __getitem__(self, idx):
         rgb_path, depth_path, pose_path = self.data_list[idx]
@@ -342,13 +359,18 @@ class RealRobotDataset(RGBDDataset):
     def get_valid_depth_mask(self, depth, max_distance=None):
         """Return metric depth and a per-pixel validity mask."""
         depth_m = self.depth_to_meters(depth)
+        if depth_m.ndim != 2:
+            raise ValueError("Depth must be a single-channel image")
 
         upper_bound = self.max_depth_m
-        if max_distance is not None and np.isfinite(max_distance):
+        if max_distance is not None:
+            if np.isnan(max_distance) or max_distance <= 0:
+                raise ValueError("filter_distance must be positive")
             upper_bound = min(upper_bound, float(max_distance))
 
         valid = (
             np.isfinite(depth_m)
+            & (depth_m > 0)
             & (depth_m >= self.min_depth_m)
             & (depth_m <= upper_bound)
         )
@@ -361,44 +383,25 @@ class RealRobotDataset(RGBDDataset):
         camera_pose=None,
         mask_img=False,
         filter_distance=np.inf,
+        return_pixel_indices=False,
     ):
         """Project an aligned real-robot RGB-D frame into a point cloud."""
         rgb_array = np.asarray(rgb)
         depth_array = np.asarray(depth)
 
-        if rgb_array.shape[:2] != depth_array.shape[:2]:
-            if mask_img:
-                raise ValueError("Mask and depth resolutions must match")
-            rgb_array = cv2.resize(
-                rgb_array,
-                (depth_array.shape[1], depth_array.shape[0]),
-                interpolation=cv2.INTER_AREA,
-            )
-
-        depth_m, valid = self.get_valid_depth_mask(
-            depth_array,
-            max_distance=filter_distance,
+        if (depth_array.shape != (self.height, self.width)
+                or rgb_array.shape[:2] != depth_array.shape):
+            raise ValueError("RGB/mask and depth must match camera.json resolution; "
+                             "register streams and update calibration before loading")
+        return super().create_pcd(
+            rgb_array, depth_array, camera_pose, mask_img, filter_distance,
+            return_pixel_indices=return_pixel_indices,
         )
 
-        if mask_img:
-            instance_mask = rgb_array.astype(bool)
-            if instance_mask.ndim == 3:
-                instance_mask = instance_mask[..., 0]
-            valid &= instance_mask
-
-        if not np.any(valid):
-            return o3d.geometry.PointCloud()
-
-        height, width = depth_m.shape
-        y, x = np.meshgrid(
-            np.arange(height),
-            np.arange(width),
-            indexing="ij",
-        )
-
-        z = depth_m[valid]
-        x = x[valid]
-        y = y[valid]
+    def _unproject_pixels(self, x, y, z):
+        """Use the same distortion-aware rays for geometry and semantic masks."""
+        if z.size == 0:
+            return np.empty((0, 3), dtype=np.float64)
         camera_matrix = self.depth_intrinsics
         if (
             not self.image_rectified
@@ -417,18 +420,10 @@ class RealRobotDataset(RGBDDataset):
             point_x = (x - camera_matrix[0, 2]) * z / camera_matrix[0, 0]
             point_y = (y - camera_matrix[1, 2]) * z / camera_matrix[1, 1]
         points = np.column_stack((point_x, point_y, z))
-
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points)
-
-        if not mask_img:
-            rgb_array = rgb_array.astype(np.uint8)
-            pcd.colors = o3d.utility.Vector3dVector(rgb_array[valid] / 255.0)
-
-        if camera_pose is not None:
-            pcd.transform(camera_pose)
-
-        return pcd
+        if self.image_rectified:
+            # R maps raw optical rays into rectified rays. Undo it before TF.
+            points = points @ self.rectification_rotation
+        return points
 
     def _load_pose(self, path):
         pose = self._convert_pose_to_hov(self._read_pose_matrix(path))

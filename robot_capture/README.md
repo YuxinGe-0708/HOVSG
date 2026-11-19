@@ -55,10 +55,11 @@ optical 点。`--camera-frame-is-optical` 是显式确认，不是坐标转换�
 
 ## 部署到机器人
 
-将本目录下五个文件放到机器人 `/home/creasen/`：
+将本目录下六个文件放到机器人 `/home/creasen/`：
 
 ```text
 collect_aurora_scene.py
+camera_geometry.py
 capture_rotation_scene.py
 sync_rgb_camera_info.py
 run_aurora_manual_capture.sh

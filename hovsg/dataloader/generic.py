@@ -7,6 +7,7 @@ from scipy.spatial import cKDTree
 import cv2
 
 from torch.utils.data import Dataset, DataLoader
+from hovsg.utils.pose_utils import as_pose_matrix
 
 class RGBDDataset(Dataset, ABC):
     """
@@ -83,7 +84,37 @@ class RGBDDataset(Dataset, ABC):
         """
         pass
     
-    def create_pcd(self, rgb, depth, camera_pose=None, mask_img=False, filter_distance=np.inf):
+    def depth_to_meters(self, depth):
+        """Convert raw depth using units per metre (not metres per unit)."""
+        if self.scale is None or not np.isfinite(self.scale) or self.scale <= 0:
+            raise ValueError("Depth scale must be finite and positive")
+        return np.asarray(depth, dtype=np.float32) / self.scale
+
+    def get_valid_depth_mask(self, depth, max_distance=None):
+        depth_m = self.depth_to_meters(depth)
+        if depth_m.ndim != 2:
+            raise ValueError("Depth must be a single-channel image")
+        valid = np.isfinite(depth_m) & (depth_m > 0)
+        if max_distance is not None:
+            if np.isnan(max_distance) or max_distance <= 0:
+                raise ValueError("filter_distance must be positive")
+            valid &= depth_m <= max_distance
+        return depth_m, valid
+
+    def _unproject_pixels(self, x, y, z):
+        camera_matrix = np.asarray(self.depth_intrinsics)
+        if (camera_matrix.shape not in ((3, 3), (4, 4))
+                or not np.isfinite(camera_matrix).all()
+                or camera_matrix[0, 0] <= 0 or camera_matrix[1, 1] <= 0):
+            raise ValueError("Invalid depth camera intrinsics")
+        return np.column_stack((
+            (x - camera_matrix[0, 2]) * z / camera_matrix[0, 0],
+            (y - camera_matrix[1, 2]) * z / camera_matrix[1, 1],
+            z,
+        ))
+
+    def create_pcd(self, rgb, depth, camera_pose=None, mask_img=False,
+                   filter_distance=np.inf, return_pixel_indices=False):
         """
         Create Open3D point cloud from RGB and depth images, and camera pose. filter_distance is used to filter out
         points that are further than a certain distance.
@@ -92,42 +123,35 @@ class RGBDDataset(Dataset, ABC):
         :param camera_pose (np.array): Camera pose
         :param mask_img (bool): Mask image
         :param filter_distance (float): Filter distance
-        :return: Open3D point cloud
+        :param return_pixel_indices (bool): Also return flat row-major source pixels.
+        :return: Point cloud, or (point cloud, pixel indices) when requested.
         """
-        # convert rgb and depth images to numpy arrays
-        rgb = np.array(rgb).astype(np.uint8)
-        depth = np.array(depth)
-        # resize rgb image to match depth image size if needed
-        if rgb.shape[0] != depth.shape[0] or rgb.shape[1] != depth.shape[1]:
-            rgb = cv2.resize(rgb, (depth.shape[1], depth.shape[0]), interpolation=cv2.INTER_AREA)
-        # load depth camera intrinsics
-        H = rgb.shape[0]
-        W = rgb.shape[1]
-        camera_matrix = self.depth_intrinsics
-        scale = self.scale
-        # create point cloud
-        y, x = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
-        depth = depth.astype(np.float32) / scale
+        # Keep the exact row-major pixel -> point mapping for feature lookup.
+        rgb = np.asarray(rgb)
+        depth_m, valid = self.get_valid_depth_mask(depth, filter_distance)
+        if rgb.shape[:2] != depth_m.shape:
+            if mask_img:
+                raise ValueError("Mask and depth resolutions must match")
+            # Legacy benchmark loaders assume registered images at different sizes.
+            rgb = cv2.resize(rgb, (depth_m.shape[1], depth_m.shape[0]),
+                             interpolation=cv2.INTER_AREA)
         if mask_img:
-            depth = depth * rgb
-        mask = depth > 0
-        x = x[mask]
-        y = y[mask]
-        depth = depth[mask]
-        # convert to 3D
-        X = (x - camera_matrix[0, 2]) * depth / camera_matrix[0, 0]
-        Y = (y - camera_matrix[1, 2]) * depth / camera_matrix[1, 1]
-        Z = depth
-        if Z.mean() > filter_distance:
-            return o3d.geometry.PointCloud()
-        # convert to open3d point cloud
-        points = np.hstack((X.reshape(-1, 1), Y.reshape(-1, 1), Z.reshape(-1, 1)))
+            if rgb.ndim != 2:
+                raise ValueError("Instance mask must be single-channel")
+            valid &= rgb.astype(bool)
+        elif rgb.ndim != 3 or rgb.shape[2] != 3:
+            raise ValueError("RGB image must have three channels")
+        pixel_indices = np.flatnonzero(valid).astype(np.int64, copy=False)
+        y, x = np.unravel_index(pixel_indices, depth_m.shape)
         pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.points = o3d.utility.Vector3dVector(
+            self._unproject_pixels(x, y, depth_m[valid]))
         if not mask_img:
-            colors = rgb[mask]
-            pcd.colors = o3d.utility.Vector3dVector(colors / 255.0)
-        pcd.transform(camera_pose)
+            pcd.colors = o3d.utility.Vector3dVector(rgb[valid].astype(np.uint8) / 255.0)
+        if camera_pose is not None:
+            pcd.transform(as_pose_matrix(camera_pose))
+        if return_pixel_indices:
+            return pcd, pixel_indices
         return pcd
     
     def create_3d_masks(

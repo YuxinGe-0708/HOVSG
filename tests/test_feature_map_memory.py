@@ -56,6 +56,17 @@ class LowMemoryFeatureAccumulatorTests(unittest.TestCase):
             (single.allocated_bytes - count_bytes) // 2,
         )
 
+    def test_many_to_one_observations_do_not_saturate_float16(self):
+        accumulator = LowMemoryFeatureAccumulator(1, 2, dtype="float16")
+        accumulator.add(torch.zeros(80000, dtype=torch.long),
+                        torch.tensor([[1., 0.]]).repeat(80000, 1))
+        accumulator.add(torch.zeros(20000, dtype=torch.long),
+                        torch.tensor([[0., 1.]]).repeat(20000, 1))
+        result = accumulator.finalize().astype(np.float32)
+        np.testing.assert_allclose(result, [[4 / np.sqrt(17), 1 / np.sqrt(17)]],
+                                   atol=1e-3)
+        self.assertEqual(accumulator.counts[0].item(), 100000)
+
 
 class GeometryCacheTests(unittest.TestCase):
     def test_cache_load_requires_an_exact_signature(self):
